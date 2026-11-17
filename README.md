@@ -14,6 +14,10 @@ The service binds to `0.0.0.0` and uses `PORT` if supplied by a hosting provider
 
 Deploy to an HTTPS domain, open it in Safari on iOS or Chrome on Android, then use the browser's **Add to Home Screen / Install app** action. The PWA caches its app shell for quicker loading. The live API and scheduled checks still need an internet connection and a running server.
 
+## Code quality
+
+Run `npm install` to install project dependencies. Use `npm run lint` to check JavaScript, `npm run lint:fix` to apply safe ESLint fixes, `npm run format` to format project files with Prettier, or `npm run format:check` to check formatting without changing files.
+
 ## iOS and Android native shells
 
 The Capacitor config points at the hosted web app. Set `server.url` in `capacitor.config.json` to the deployed HTTPS domain. Then run:
