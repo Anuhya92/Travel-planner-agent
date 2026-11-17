@@ -1,0 +1,12 @@
+{
+  "name": "SL Commute Agent",
+  "short_name": "Commute Agent",
+  "description": "Route-specific SL commute alerts and demo taxi bookings.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f7f6",
+  "theme_color": "#f7f8fa",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
