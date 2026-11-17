@@ -93,6 +93,9 @@ async function searchLocations(side, query) {
 
 function showStatus(result) {
   if (!result) {
+    $('disruptionList').replaceChildren();
+    $('bookingNote').classList.add('hidden');
+    $('checkedAt').textContent = '';
     if (settings.home_location && settings.office_location) {
       $('statusTitle').textContent = 'Ready to check your route';
       $('statusSummary').textContent =
@@ -136,7 +139,7 @@ function showStatus(result) {
     const booking = result.fake_uber_booking;
     $('bookingNote').innerHTML = booking
       ? `<strong>Demo Uber ride booked automatically</strong><br>Reference: ${escapeHtml(booking.booking_reference)}<br>${escapeHtml(booking.product)} · pickup ${escapeHtml(new Date(booking.pickup_time).toLocaleTimeString('sv-SE', { timeZone: 'Europe/Stockholm', hour: '2-digit', minute: '2-digit' }))}<br>${escapeHtml(booking.pickup)} → ${escapeHtml(booking.destination)}<br>${escapeHtml(booking.driver)} · ${escapeHtml(booking.vehicle)} · ${escapeHtml(booking.eta_minutes)} min ETA<br><span class="fineprint">${escapeHtml(booking.note)}</span>`
-      : 'A demo ride will be created when a delay above your threshold is detected.';
+      : 'No demo ride was created: SL has not reported a positive delay above your buffer.';
   } else if (result.status === 'caution') {
     $('statusTitle').textContent = 'SL notice on your route';
     $('statusSummary').textContent =
@@ -213,6 +216,7 @@ async function saveSettings() {
         : [...$('daysCustom').querySelectorAll('input:checked')].map((input) => input.value);
   if (!days.length) return alert('Choose at least one day.');
   const alertBefore = Math.max(5, Math.min(120, Number($('alertBefore').value) || 20));
+  const delayBuffer = Math.max(0, Math.min(120, Number($('delayBuffer').value) || 0));
   const payload = {
     home: locationTitle(home),
     office: locationTitle(office),
@@ -220,10 +224,19 @@ async function saveSettings() {
     office_location: office,
     departure_time: $('departureTime').value || '08:00',
     alert_before_minutes: alertBefore,
+    delay_buffer_minutes: delayBuffer,
     days,
   };
   try {
-    await request('/api/settings', { method: 'POST', body: JSON.stringify(payload) });
+    const saved = await request('/api/settings', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    settings = saved;
+    if (saved.configuration_changed) {
+      knownResultAt = null;
+      showStatus(null);
+    }
     const route = await request(
       `/api/route?origin=${encodeURIComponent(home.id || home.name)}&destination=${encodeURIComponent(office.id || office.name)}`,
     );
@@ -234,12 +247,12 @@ async function saveSettings() {
       route_stops: route.route_stops,
     };
     updateUberLink();
-    $('serverStatus').textContent = `Alert ${alertBefore} min before departure`;
+    $('serverStatus').textContent = `Alert ${alertBefore} min before · ${delayBuffer} min buffer`;
     $('serverStatus').classList.add('on');
     if ('Notification' in window && Notification.permission === 'default')
       await Notification.requestPermission();
     alert(
-      `Commute saved. The SL check is scheduled for ${alertBefore} minutes before departure. ${route.route_lines.length ? `The planner found ${route.route_lines.length} line(s) on your route.` : 'The planner did not return line details; the alert will avoid claiming a clear result if it cannot estimate the route.'}`,
+      `Commute saved. The SL check is scheduled for ${alertBefore} minutes before departure. Delays up to ${delayBuffer} minutes are okay before the app suggests Uber. ${route.route_lines.length ? `The planner found ${route.route_lines.length} line(s) on your route.` : 'The planner did not return line details; the alert will avoid claiming a clear result if it cannot estimate the route.'}`,
     );
   } catch (error) {
     alert(error.message);
@@ -348,7 +361,7 @@ function init() {
   $('checkNow').addEventListener('click', checkNow);
   $('saveSettings').addEventListener('click', saveSettings);
   $('shareAlert').addEventListener('click', shareAlert);
-  for (const id of ['departureTime', 'alertBefore', 'dayPreset'])
+  for (const id of ['departureTime', 'alertBefore', 'delayBuffer', 'dayPreset'])
     $(id).addEventListener('input', () => formTouched.add('schedule'));
   $('dayPreset').addEventListener('change', () =>
     $('daysCustom').classList.toggle('hidden', $('dayPreset').value !== 'custom'),
@@ -370,6 +383,7 @@ function init() {
         $('departureTime').value =
           saved.departure_time || (saved.check_time ? saved.check_time : '08:00');
         $('alertBefore').value = saved.alert_before_minutes || 20;
+        $('delayBuffer').value = saved.delay_buffer_minutes ?? saved.alert_before_minutes ?? 20;
       }
       const selectedDays = saved.days || DAYS.slice(0, 5);
       if (selectedDays.length === 7) $('dayPreset').value = 'everyday';

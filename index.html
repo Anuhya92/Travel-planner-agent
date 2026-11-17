@@ -90,7 +90,7 @@
           <div class="schedule-row">
             <label>Depart at<input id="departureTime" type="time" value="08:00" /></label
             ><label
-              >Alert before<input
+              >Alert before (mins)<input
                 id="alertBefore"
                 type="number"
                 value="20"
@@ -101,16 +101,27 @@
           </div>
           <div class="schedule-row single">
             <label
+              >Delay buffer (mins)<input
+                id="delayBuffer"
+                type="number"
+                value="20"
+                min="0"
+                max="120"
+                step="5"
+            /></label>
+            <p class="fineprint threshold-note">
+              A demo Uber ride is created when the reported delay is greater than this buffer.
+            </p>
+          </div>
+          <div class="schedule-row single">
+            <label
               >Days<select id="dayPreset">
                 <option value="weekdays">Weekdays</option>
                 <option value="everyday">Every day</option>
                 <option value="custom">Choose days</option>
               </select></label
             >
-            <p class="fineprint threshold-note">
-              If the SL journey estimate is delayed by more than this many minutes, the alert will
-              suggest Uber.
-            </p>
+            <span></span>
           </div>
           <div id="daysCustom" class="days hidden">
             <label><input type="checkbox" value="Mon" /> Mon</label

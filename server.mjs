@@ -11,7 +11,7 @@ const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number(process.env.PORT || 8765);
 const SL_API = 'https://deviations.integration.sl.se/v1/messages';
 const PLANNER = 'https://journeyplanner.integration.sl.se/v2';
-const FILTER_VERSION = 3;
+const FILTER_VERSION = 4;
 const DEFAULTS = {
   home: '',
   office: '',
@@ -19,6 +19,7 @@ const DEFAULTS = {
   office_location: null,
   departure_time: '08:00',
   alert_before_minutes: 20,
+  delay_buffer_minutes: 20,
   days: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'],
   line_ids: '',
   route_lines: [],
@@ -208,6 +209,23 @@ function timeRangeOverlapsWindow(ranges, window) {
   });
 }
 
+function reportedDelayMinutes(message) {
+  const text = (message.message_variants || [])
+    .map((variant) => `${variant.header || ''} ${variant.details || ''}`)
+    .join(' ');
+  const patterns = [
+    /(?:ca\.?|cirka|approximately|about|around)?\s*(\d{1,3})\s*(?:minut(?:er)?|minutes?|mins?)\s*(?:sent|late|försenad|försenat|försenade)/giu,
+    /(?:försenad|försenat|försenade|delay(?:ed)?(?:\s+by)?)\s*(?:ca\.?|cirka|approximately|about)?\s*(\d{1,3})\s*(?:minut(?:er)?|minutes?|mins?)/giu,
+  ];
+  let maxDelay = 0;
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      maxDelay = Math.max(maxDelay, Number(match[1]) || 0);
+    }
+  }
+  return maxDelay;
+}
+
 function stockholmNow() {
   const values = Object.fromEntries(
     new Intl.DateTimeFormat('en-GB', {
@@ -251,7 +269,7 @@ async function checkDisruptions(settings, scheduled) {
     plannedArrival && estimatedArrival
       ? Math.max(0, Math.round((Date.parse(estimatedArrival) - Date.parse(plannedArrival)) / 60000))
       : 0;
-  const predictedDelayMinutes = Math.max(estimateDelta, arrivalDelta);
+  let noticeDelayMinutes = 0;
   const customIds = new Set(
     String(settings.line_ids || '')
       .replaceAll(';', ',')
@@ -287,6 +305,7 @@ async function checkDisruptions(settings, scheduled) {
     const stopMatch = [...selectedStops].some((name) => affectedStops.has(name));
     const relevant = lines.length && stops.length ? lineMatch && stopMatch : lineMatch || stopMatch;
     if (!relevant) continue;
+    noticeDelayMinutes = Math.max(noticeDelayMinutes, reportedDelayMinutes(message));
     const variant = variants.find((v) => v.language === 'en') || variants[0] || {};
     matches.push({
       header: variant.header || 'SL disruption',
@@ -297,8 +316,12 @@ async function checkDisruptions(settings, scheduled) {
       priority: message.priority?.importance_level,
     });
   }
+  const predictedDelayMinutes = Math.max(estimateDelta, arrivalDelta, noticeDelayMinutes);
   const checkedAt = new Date().toISOString();
-  const delayThreshold = Number(settings.alert_before_minutes) || 20;
+  const configuredThreshold = settings.delay_buffer_minutes ?? settings.alert_before_minutes;
+  const delayThreshold = Number.isFinite(Number(configuredThreshold))
+    ? Number(configuredThreshold)
+    : 20;
   const needsUber = Boolean(journey && predictedDelayMinutes > delayThreshold);
   return {
     filter_version: FILTER_VERSION,
@@ -473,8 +496,29 @@ async function handle(request, response) {
       return send(response, 200, await runCheck());
     if (request.method === 'POST') {
       const body = await readBody(request);
-      if (url.pathname === '/api/settings')
-        return send(response, 200, await writeSettings({ ...(await readSettings()), ...body }));
+      if (url.pathname === '/api/settings') {
+        const current = await readSettings();
+        const updated = { ...current, ...body };
+        const configFields = [
+          'home_location',
+          'office_location',
+          'departure_time',
+          'alert_before_minutes',
+          'delay_buffer_minutes',
+          'days',
+        ];
+        const configurationChanged = configFields.some(
+          (field) =>
+            JSON.stringify(current[field] ?? null) !== JSON.stringify(updated[field] ?? null),
+        );
+        if (configurationChanged) {
+          updated.last_result = null;
+          updated.last_check = null;
+          updated.last_scheduled_minute = null;
+        }
+        const saved = await writeSettings(updated);
+        return send(response, 200, { ...saved, configuration_changed: configurationChanged });
+      }
     }
 
     if (

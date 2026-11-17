@@ -37,7 +37,7 @@ iOS builds require macOS and Xcode. Android builds require Android Studio and it
 
 - SL Journey Planner autocomplete and route estimates; SL Deviations route and travel-window matching.
 - Explicit SL notice clock ranges are checked against the expected travel window.
-- A local simulated Uber ride record is created when the estimated delay exceeds the configured threshold. It never contacts Uber, dispatches a driver, or charges anyone.
+- The **Alert before** setting controls when the commute check runs. The separate **Delay buffer** sets how many minutes of delay you are willing to accept before a local simulated Uber ride is shown. It never contacts Uber, dispatches a driver, or charges anyone.
 - The Uber link opens a prefilled real ride for the user to review and confirm.
 
 ## Before a public launch
