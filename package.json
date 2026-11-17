@@ -1,0 +1,21 @@
+{
+  "name": "sl-commute-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "web": "node server.mjs",
+    "mobile:init": "cap add ios && cap add android",
+    "mobile:sync": "cap sync"
+  },
+  "dependencies": {
+    "@capacitor/android": "^7.4.3",
+    "@capacitor/cli": "^7.4.3",
+    "@capacitor/core": "^7.4.3",
+    "@capacitor/ios": "^7.4.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
