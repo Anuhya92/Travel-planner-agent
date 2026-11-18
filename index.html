@@ -12,21 +12,63 @@
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
-    <main class="shell">
+    <main id="authPanel" class="auth-shell hidden">
+      <section class="card auth-card">
+        <span class="mark auth-mark">S</span>
+        <p class="eyebrow">COMMUTE AGENT FOR TEAMS</p>
+        <h1 id="authTitle">Create your account</h1>
+        <p class="muted">Keep your route and commute alerts private to your account.</p>
+        <p class="fineprint">
+          Each employee controls their own commute profile. If Claude is enabled, route details and
+          matching SL notices are sent to Anthropic for the assessment. No employer dashboard is
+          included.
+        </p>
+        <form id="authForm">
+          <label
+            >Username<input
+              id="authUsername"
+              autocomplete="username"
+              minlength="3"
+              maxlength="32"
+              required
+          /></label>
+          <label
+            >Password<input
+              id="authPassword"
+              type="password"
+              autocomplete="current-password"
+              minlength="10"
+              required
+          /></label>
+          <p id="authError" class="auth-error" aria-live="polite"></p>
+          <button id="authSubmit" class="button dark full" type="submit">Create account</button>
+        </form>
+        <button id="authMode" class="text-button" type="button">
+          Already have an account? Sign in
+        </button>
+      </section>
+    </main>
+    <main id="appShell" class="shell hidden">
       <header class="topbar">
         <div class="brand">
           <span class="mark">S</span>
-          <div><strong>Commute Agent</strong><small>Stockholm · SL + Uber</small></div>
+          <div>
+            <strong>Commute Agent</strong><small>Staff punctuality · SL commute support</small>
+          </div>
         </div>
-        <span id="serverStatus" class="status-pill">Starting…</span>
+        <div class="account-actions">
+          <span id="accountName" class="account-name"></span
+          ><button id="logout" class="text-button" type="button">Sign out</button
+          ><span id="serverStatus" class="status-pill">Starting…</span>
+        </div>
       </header>
       <section class="hero">
         <div>
-          <p class="eyebrow">YOUR DAILY COMMUTE</p>
-          <h1>Arrive with a plan.</h1>
+          <p class="eyebrow">STAFF PUNCTUALITY SUPPORT</p>
+          <h1>Help your team arrive on time.</h1>
           <p class="lede">
-            Check SL before you leave. If disruption affects your route, review a taxi option in
-            Uber.
+            Route-aware SL alerts help staff spot travel risks early, make a plan, and review an
+            alternative ride when disruptions threaten their commute.
           </p>
         </div>
         <div class="hero-icon" aria-hidden="true">↗</div>
@@ -43,6 +85,7 @@
           <p id="statusSummary" class="muted">
             Add your home and work locations to begin monitoring.
           </p>
+          <p id="assessmentMeta" class="fineprint"></p>
           <p id="checkedAt" class="small muted"></p>
           <p id="routeSummary" class="small muted"></p>
           <div id="disruptionList" class="disruptions"></div>
@@ -139,8 +182,9 @@
         </div>
       </section>
       <footer>
-        SL locations and journey estimates come from SL’s journey planner. Delay alerts create a
-        local demo ride for display; open Uber separately to review and confirm a real booking.
+        Commute support to help teams arrive on time. Claude assesses matching SL notices when the
+        service is configured; SL remains the source for route and disruption data. Demo rides are
+        simulations only.
       </footer>
     </main>
     <script src="/app.js"></script>

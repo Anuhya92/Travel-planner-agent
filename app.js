@@ -4,6 +4,7 @@ let knownResultAt = null;
 let locations = { home: null, office: null };
 let searchTimers = {};
 let formTouched = new Set();
+let authMode = 'register';
 const sessionStartedAt = Date.now();
 const $ = (id) => document.getElementById(id);
 
@@ -92,6 +93,13 @@ async function searchLocations(side, query) {
 }
 
 function showStatus(result) {
+  $('assessmentMeta').textContent = result
+    ? result.ai_assessment
+      ? `AI assessment · ${result.ai_assessment.severity} · ${result.ai_assessment.affected ? 'route affected' : 'route impact unclear'} · ${result.ai_assessment.recommendation.replaceAll('_', ' ')}`
+      : result.assessment_mode === 'rules'
+        ? 'Rule-based assessment · Claude is not configured or could not be reached.'
+        : ''
+    : '';
   if (!result) {
     $('disruptionList').replaceChildren();
     $('bookingNote').classList.add('hidden');
@@ -156,6 +164,9 @@ function showStatus(result) {
     icon.textContent = '?';
     icon.classList.add('unknown');
     $('uberLink').classList.add('hidden');
+  }
+  if (result.ai_assessment?.notification) {
+    $('statusSummary').textContent = result.ai_assessment.notification;
   }
 
   for (const item of result.disruptions || []) {
@@ -251,6 +262,7 @@ async function saveSettings() {
     $('serverStatus').classList.add('on');
     if ('Notification' in window && Notification.permission === 'default')
       await Notification.requestPermission();
+    await subscribeForPush();
     alert(
       `Commute saved. The SL check is scheduled for ${alertBefore} minutes before departure. Delays up to ${delayBuffer} minutes are okay before the app suggests Uber. ${route.route_lines.length ? `The planner found ${route.route_lines.length} line(s) on your route.` : 'The planner did not return line details; the alert will avoid claiming a clear result if it cannot estimate the route.'}`,
     );
@@ -407,4 +419,79 @@ function init() {
   poll();
   setInterval(poll, 5000);
 }
-init();
+
+async function subscribeForPush() {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+  try {
+    const { publicKey } = await request('/api/push/key');
+    if (!publicKey || Notification.permission !== 'granted') return;
+    const registration = await navigator.serviceWorker.ready;
+    let subscription = await registration.pushManager.getSubscription();
+    if (!subscription) {
+      const keyBytes = Uint8Array.from(
+        atob(publicKey.replace(/-/gu, '+').replace(/_/gu, '/')),
+        (char) => char.charCodeAt(0),
+      );
+      subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: keyBytes,
+      });
+    }
+    await request('/api/push/subscribe', { method: 'POST', body: JSON.stringify(subscription) });
+  } catch (error) {
+    console.warn('Push notifications are not enabled:', error.message);
+  }
+}
+
+function showAuth(mode = 'register') {
+  authMode = mode;
+  $('appShell').classList.add('hidden');
+  $('authPanel').classList.remove('hidden');
+  $('authTitle').textContent = mode === 'register' ? 'Create your account' : 'Welcome back';
+  $('authSubmit').textContent = mode === 'register' ? 'Create account' : 'Sign in';
+  $('authMode').textContent =
+    mode === 'register' ? 'Already have an account? Sign in' : 'New here? Create an account';
+  $('authPassword').autocomplete = mode === 'register' ? 'new-password' : 'current-password';
+}
+
+async function startApp() {
+  $('authMode').addEventListener('click', () =>
+    showAuth(authMode === 'register' ? 'login' : 'register'),
+  );
+  $('authForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    $('authError').textContent = '';
+    $('authSubmit').disabled = true;
+    try {
+      await request(`/api/auth/${authMode}`, {
+        method: 'POST',
+        body: JSON.stringify({
+          username: $('authUsername').value,
+          password: $('authPassword').value,
+        }),
+      });
+      window.location.reload();
+    } catch (error) {
+      $('authError').textContent = error.message;
+    } finally {
+      $('authSubmit').disabled = false;
+    }
+  });
+  $('logout').addEventListener('click', async () => {
+    await request('/api/auth/logout', { method: 'POST', body: '{}' });
+    window.location.reload();
+  });
+  try {
+    const { user } = await request('/api/auth/me');
+    if (!user) return showAuth();
+    $('accountName').textContent = user.username;
+    $('authPanel').classList.add('hidden');
+    $('appShell').classList.remove('hidden');
+    init();
+  } catch {
+    showAuth();
+    $('authError').textContent = 'Could not connect to the commute service.';
+  }
+}
+
+startApp();

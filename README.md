@@ -1,45 +1,41 @@
-# SL Commute Agent
+# Commute Agent
 
-The project is packaged as a responsive web app, an installable PWA, and Capacitor shells for Android and iOS. The web service is a single-user beta: commute settings live in `commute.json` on the server. Do not expose it as a public multi-user service until authentication, per-user storage, and protected settings APIs are added.
+A commute reliability tool for staff teams. It checks route-specific SL notices around each employee's travel window, uses Claude to assess disruption severity and recommend whether to continue, leave earlier, check SL, or consider a taxi, then sends a plain-language push alert. The demo Uber record remains simulated and never places a real order.
 
-## Run locally
+## Local setup
 
 1. Install Node.js 20 or later.
-2. Run `npm start` or double-click `start.bat`.
-3. Open `http://127.0.0.1:8765`, choose home and work suggestions, set the departure schedule, and save.
+2. Run `npm install` and set `ANTHROPIC_API_KEY` to enable Claude's live assessment.
+3. Optional: configure the Web Push VAPID variables below for alerts when the app is closed.
+4. Run `npm start` or double-click `start.bat`, open `http://127.0.0.1:8765`, and create an account.
 
-The service binds to `0.0.0.0` and uses `PORT` if supplied by a hosting provider. Persistent storage must be mounted for `commute.json`; the included Dockerfile is a starting point, not a complete production deployment. Configure HTTPS at the hosting layer. Schedule checks run inside the Node process, so a host that sleeps or restarts needs an external scheduler for reliable alerts.
+Each account has its own commute settings, check results, push subscriptions, and simulated ride history. Passwords are stored as salted scrypt hashes. Sessions are held in memory and users sign in again after a server restart. This JSON store is suitable for a small single-instance beta; use a managed database and session store before scaling out.
 
-## Install as a web app
+## AI assessment
 
-Deploy to an HTTPS domain, open it in Safari on iOS or Chrome on Android, then use the browser's **Add to Home Screen / Install app** action. The PWA caches its app shell for quicker loading. The live API and scheduled checks still need an internet connection and a running server.
+The server sends the route's line and stop names, the expected travel window, delay buffer, and matched SL notice text to Anthropic's Claude Messages API. Configure `ANTHROPIC_API_KEY` and optionally `ANTHROPIC_MODEL` (default `claude-sonnet-4-6`). The key remains server-side. If the key is missing or Claude fails, the app marks the result as rule-based and retains the SL and planner evidence rather than presenting it as an AI assessment.
 
-## Code quality
+## Web push
 
-Run `npm install` to install project dependencies. Use `npm run lint` to check JavaScript, `npm run lint:fix` to apply safe ESLint fixes, `npm run format` to format project files with Prettier, or `npm run format:check` to check formatting without changing files.
+Generate application server keys with `npx web-push generate-vapid-keys`. Set `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, and `VAPID_SUBJECT` (a contact such as `mailto:team@example.com`) on the server. Users must sign in, allow notifications, and save their commute from an HTTPS PWA-capable browser. Scheduled server checks send push notifications to registered devices. Push delivery depends on browser and operating-system support; the Capacitor shells do not yet integrate native APNs or Firebase Cloud Messaging.
 
-## iOS and Android native shells
+## Deploy to Render
 
-The Capacitor config points at the hosted web app. Set `server.url` in `capacitor.config.json` to the deployed HTTPS domain. Then run:
+The included `render.yaml` defines a Node web service, health check, persistent disk for account data, and secret environment variable prompts. Push the project branch to GitHub, connect the repository in Render, and create a Blueprint from `render.yaml`. Enter `ANTHROPIC_API_KEY` and the three VAPID values in the Render prompt. Keep the service at one instance while using the JSON file store. The paid web service and persistent disk keep the process scheduler running and retain accounts across deploys.
 
-```sh
-npm install
-npx cap add ios
-npx cap add android
-npx cap sync
-npx cap open ios
-npx cap open android
-```
+Render's free or sleeping services are not suitable for reliable scheduled checks. The app checks schedules in the always-on web process using Europe/Stockholm time. Keep scheduled tasks server-side; the user's browser does not need to remain open for Web Push delivery.
 
-iOS builds require macOS and Xcode. Android builds require Android Studio and its SDK. The generated apps are WebView shells around the hosted service; native push notifications and app-store signing are not configured yet. Browser notifications require the web page to be available, so the current schedule does not guarantee background mobile alerts. Reliable iOS and Android alerts need per-user accounts, device registration, push services, and a hosted scheduler.
+## Install on phones
 
-## Current behavior
+Open the deployed HTTPS URL in Safari on iOS or Chrome on Android and choose **Add to Home Screen**. Capacitor iOS and Android shells can also load the hosted site; iOS app builds require macOS and Xcode, while Android builds need Android Studio. Native push integration and store release signing remain separate mobile release work.
 
-- SL Journey Planner autocomplete and route estimates; SL Deviations route and travel-window matching.
-- Explicit SL notice clock ranges are checked against the expected travel window.
-- The **Alert before** setting controls when the commute check runs. The separate **Delay buffer** sets how many minutes of delay you are willing to accept before a local simulated Uber ride is shown. It never contacts Uber, dispatches a driver, or charges anyone.
-- The Uber link opens a prefilled real ride for the user to review and confirm.
+## Team use and privacy
 
-## Before a public launch
+This supports staff punctuality by giving each person private route-aware warnings and a chance to plan a backup ride. It does not share employee route or incident details with an employer dashboard. Claude receives the commute route, stops, travel window, and matching SL notice text when AI assessment is enabled. Provide clear notice and retention controls before using this for a workforce. The current JSON storage has no self-service password reset, account deletion, or administrator controls; add those and move to a managed database before a broad organizational launch.
 
-Implement user sign-in and per-user encrypted settings storage, secure API access, cloud persistence, a scheduled worker, push notification enrollment and delivery, and production monitoring. Add account deletion and data retention controls. Native app releases also need signing credentials and store review.
+## Commands
+
+- `npm start` — run the service
+- `npm run lint` — check JavaScript
+- `npm run format` — format project files
+- `npm run format:check` — verify formatting

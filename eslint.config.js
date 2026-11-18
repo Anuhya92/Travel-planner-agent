@@ -7,7 +7,7 @@ export default [
   },
   js.configs.recommended,
   {
-    files: ['server.mjs', 'eslint.config.js', 'capacitor.config.json'],
+    files: ['server.mjs', 'eslint.config.js'],
     languageOptions: {
       globals: globals.node,
       ecmaVersion: 'latest',

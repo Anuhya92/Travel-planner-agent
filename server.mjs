@@ -1,17 +1,19 @@
 import http from 'node:http';
-import { randomUUID } from 'node:crypto';
-import { readFile, writeFile } from 'node:fs/promises';
+import { randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
+import webpush from 'web-push';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
-const DATA = path.join(ROOT, 'commute.json');
+const DATA = process.env.APP_DATA_FILE || path.join(ROOT, 'app-data.json');
 const TZ = 'Europe/Stockholm';
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number(process.env.PORT || 8765);
 const SL_API = 'https://deviations.integration.sl.se/v1/messages';
 const PLANNER = 'https://journeyplanner.integration.sl.se/v2';
-const FILTER_VERSION = 4;
+const FILTER_VERSION = 5;
 const DEFAULTS = {
   home: '',
   office: '',
@@ -28,25 +30,131 @@ const DEFAULTS = {
   last_check: null,
   last_result: null,
 };
-let checking = false;
+const checking = new Set();
+const sessions = new Map();
+const scrypt = promisify(scryptCallback);
+let vapidConfigured = false;
 
-async function readSettings() {
+async function readStore() {
   try {
-    const settings = { ...DEFAULTS, ...JSON.parse(await readFile(DATA, 'utf8')) };
-    if (settings.last_result && settings.last_result.filter_version !== FILTER_VERSION) {
-      settings.last_result = null;
-      settings.last_check = null;
-    }
-    return settings;
-  } catch {
-    return { ...DEFAULTS };
+    return JSON.parse(await readFile(DATA, 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return { users: {} };
+    throw error;
   }
 }
 
-async function writeSettings(value) {
+async function writeStore(store) {
+  await mkdir(path.dirname(DATA), { recursive: true });
+  await writeFile(DATA, JSON.stringify(store, null, 2), 'utf8');
+}
+
+async function readSettings(userId) {
+  const store = await readStore();
+  const user = store.users[userId];
+  if (!user) throw new Error('Account not found.');
+  const settings = { ...DEFAULTS, ...(user.settings || {}) };
+  if (settings.last_result && settings.last_result.filter_version !== FILTER_VERSION) {
+    settings.last_result = null;
+    settings.last_check = null;
+  }
+  return settings;
+}
+
+async function writeSettings(userId, value) {
+  const store = await readStore();
+  const user = store.users[userId];
+  if (!user) throw new Error('Account not found.');
   const safe = { ...DEFAULTS, ...value };
-  await writeFile(DATA, JSON.stringify(safe, null, 2), 'utf8');
+  user.settings = safe;
+  await writeStore(store);
   return safe;
+}
+
+function parseCookies(request) {
+  return Object.fromEntries(
+    String(request.headers.cookie || '')
+      .split(';')
+      .map((part) => part.trim().split('='))
+      .filter(([key, value]) => key && value)
+      .map(([key, ...value]) => [key, decodeURIComponent(value.join('='))]),
+  );
+}
+
+function authenticatedUser(request) {
+  const token = parseCookies(request).commute_session;
+  const session = token && sessions.get(token);
+  if (!session || session.expiresAt <= Date.now()) {
+    if (token) sessions.delete(token);
+    return null;
+  }
+  return { id: session.userId, username: session.username };
+}
+
+function sessionCookie(token, maxAge = 60 * 60 * 24 * 14) {
+  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  return `commute_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure}`;
+}
+
+function createSession(user) {
+  const token = randomBytes(32).toString('base64url');
+  sessions.set(token, {
+    userId: user.id,
+    username: user.username,
+    expiresAt: Date.now() + 14 * 24 * 60 * 60 * 1000,
+  });
+  return token;
+}
+
+async function hashPassword(password, salt = randomBytes(16).toString('hex')) {
+  const derived = await scrypt(password, salt, 64);
+  return { salt, hash: derived.toString('hex') };
+}
+
+async function verifyPassword(password, user) {
+  const derived = await scrypt(password, user.password_salt, 64);
+  const stored = Buffer.from(user.password_hash, 'hex');
+  return stored.length === derived.length && timingSafeEqual(stored, derived);
+}
+
+async function sendPushNotifications(userId, result) {
+  if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) return;
+  const settings = await readSettings(userId);
+  const subscriptions = settings.push_subscriptions || [];
+  if (!subscriptions.length) return;
+  if (!vapidConfigured) {
+    webpush.setVapidDetails(
+      process.env.VAPID_SUBJECT || 'mailto:admin@example.com',
+      process.env.VAPID_PUBLIC_KEY,
+      process.env.VAPID_PRIVATE_KEY,
+    );
+    vapidConfigured = true;
+  }
+  const payload = JSON.stringify({
+    title: result.status === 'delay' ? 'Commute disruption: plan a backup' : 'Commute update',
+    body:
+      result.ai_assessment?.notification ||
+      result.note ||
+      (result.status === 'clear'
+        ? 'Your SL route looks good for the commute window.'
+        : `SL reports a ${result.predicted_delay_minutes || 0}-minute delay affecting the route.`),
+    url: '/',
+  });
+  const expired = new Set();
+  await Promise.all(
+    subscriptions.map(async (subscription, index) => {
+      try {
+        await webpush.sendNotification(subscription, payload);
+      } catch (error) {
+        if ([404, 410].includes(error.statusCode)) expired.add(index);
+        else console.error('Push delivery failed:', error.message);
+      }
+    }),
+  );
+  if (expired.size) {
+    settings.push_subscriptions = subscriptions.filter((_, index) => !expired.has(index));
+    await writeSettings(userId, settings);
+  }
 }
 
 async function fetchJson(url, { method = 'GET', body, headers = {} } = {}) {
@@ -226,6 +334,61 @@ function reportedDelayMinutes(message) {
   return maxDelay;
 }
 
+async function assessWithClaude({ route, window, notices, predictedDelayMinutes, delayBuffer }) {
+  if (!process.env.ANTHROPIC_API_KEY) return null;
+  const response = await fetchJson('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: {
+      model: process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6',
+      max_tokens: 500,
+      system: [
+        'You are a Stockholm public-transport commute disruption analyst.',
+        'Use only the supplied SL notices and route data. Do not invent closures, delays, or alternatives.',
+        'Assess whether the affected lines and stops overlap the user route and travel window.',
+        'Return one JSON object only with keys: severity (low|moderate|high|critical), affected (boolean), recommendation (continue|leave_early|taxi|check_sl), reason (short plain language), notification (one or two plain-language sentences).',
+        'Recommend taxi when the reported or live delay exceeds the user delay buffer, or the route is seriously blocked. Recommend leave_early only if an actionable disruption threatens the route. If evidence is insufficient, use check_sl.',
+      ].join(' '),
+      messages: [
+        {
+          role: 'user',
+          content: JSON.stringify({
+            route,
+            travel_window: window,
+            delay_buffer_minutes: delayBuffer,
+            planner_delay_minutes: predictedDelayMinutes,
+            matching_sl_notices: notices,
+          }),
+        },
+      ],
+    },
+  });
+  const text = response.content?.find((block) => block.type === 'text')?.text || '';
+  const parsed = JSON.parse(text.match(/\{[\s\S]*\}/)?.[0] || 'null');
+  const severities = new Set(['low', 'moderate', 'high', 'critical']);
+  const recommendations = new Set(['continue', 'leave_early', 'taxi', 'check_sl']);
+  if (
+    typeof parsed?.affected !== 'boolean' ||
+    !severities.has(parsed.severity) ||
+    !recommendations.has(parsed.recommendation) ||
+    typeof parsed.notification !== 'string'
+  ) {
+    throw new Error('Claude returned an invalid commute assessment.');
+  }
+  return {
+    provider: 'Claude',
+    model: process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6',
+    severity: parsed.severity,
+    affected: parsed.affected,
+    recommendation: parsed.recommendation,
+    reason: String(parsed.reason || '').slice(0, 400),
+    notification: parsed.notification.slice(0, 500),
+  };
+}
+
 function stockholmNow() {
   const values = Object.fromEntries(
     new Intl.DateTimeFormat('en-GB', {
@@ -322,7 +485,25 @@ async function checkDisruptions(settings, scheduled) {
   const delayThreshold = Number.isFinite(Number(configuredThreshold))
     ? Number(configuredThreshold)
     : 20;
-  const needsUber = Boolean(journey && predictedDelayMinutes > delayThreshold);
+  let aiAssessment = null;
+  let aiError = null;
+  try {
+    aiAssessment = await assessWithClaude({
+      route: { home: settings.home, office: settings.office, lines: routeLines, stops: routeStops },
+      window: { from: travelWindow.start.toISOString(), until: travelWindow.end.toISOString() },
+      notices: matches,
+      predictedDelayMinutes,
+      delayBuffer: delayThreshold,
+    });
+  } catch (error) {
+    aiError = error.message;
+    console.error('Claude commute assessment failed:', error.message);
+  }
+  const needsUber = Boolean(
+    journey &&
+    (predictedDelayMinutes > delayThreshold ||
+      (aiAssessment?.affected && aiAssessment.recommendation === 'taxi')),
+  );
   return {
     filter_version: FILTER_VERSION,
     checked_at: checkedAt,
@@ -336,6 +517,9 @@ async function checkDisruptions(settings, scheduled) {
             : 'clear',
     predicted_delay_minutes: predictedDelayMinutes,
     delay_threshold_minutes: delayThreshold,
+    ai_assessment: aiAssessment,
+    ai_error: aiError,
+    assessment_mode: aiAssessment ? 'ai' : 'rules',
     needs_uber: needsUber,
     travel_window: {
       from: travelWindow.start.toISOString(),
@@ -380,11 +564,11 @@ function createDemoUberBooking(settings, result) {
   return booking;
 }
 
-async function runCheck(scheduled = false) {
-  if (checking) return (await readSettings()).last_result;
-  checking = true;
+async function runCheck(userId, scheduled = false) {
+  if (checking.has(userId)) return (await readSettings(userId)).last_result;
+  checking.add(userId);
   try {
-    const settings = await readSettings();
+    const settings = await readSettings(userId);
     let result;
     try {
       result = await checkDisruptions(settings, scheduled);
@@ -400,44 +584,52 @@ async function runCheck(scheduled = false) {
     }
     const demoBooking = createDemoUberBooking(settings, result);
     if (demoBooking) result.fake_uber_booking = demoBooking;
-    await writeSettings({ ...settings, last_check: result.checked_at, last_result: result });
+    await writeSettings(userId, {
+      ...settings,
+      last_check: result.checked_at,
+      last_result: result,
+    });
     return result;
   } finally {
-    checking = false;
+    checking.delete(userId);
   }
 }
 
 async function scheduleTick() {
   try {
     const now = stockholmNow();
-    const settings = await readSettings();
-    const [departureHour, departureMinute] = String(settings.departure_time || '08:00')
-      .split(':')
-      .map(Number);
-    const alertMinutes = Number(settings.alert_before_minutes) || 20;
-    const checkAt = new Date(Date.UTC(2000, 0, 1, departureHour, departureMinute - alertMinutes));
-    const targetTime = `${String(checkAt.getUTCHours()).padStart(2, '0')}:${String(checkAt.getUTCMinutes()).padStart(2, '0')}`;
-    const week = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-    const targetDay =
-      departureHour * 60 + departureMinute < alertMinutes
-        ? week[(week.indexOf(now.weekday) + 1) % week.length]
-        : now.weekday;
-    if (
-      settings.home &&
-      settings.office &&
-      (settings.days || []).includes(targetDay) &&
-      now.hour + ':' + now.minute === targetTime &&
-      settings.last_scheduled_minute !== now.stamp
-    ) {
-      await writeSettings({ ...settings, last_scheduled_minute: now.stamp });
-      await runCheck(true);
+    const { users } = await readStore();
+    for (const [userId, user] of Object.entries(users)) {
+      const settings = { ...DEFAULTS, ...(user.settings || {}) };
+      const [departureHour, departureMinute] = String(settings.departure_time || '08:00')
+        .split(':')
+        .map(Number);
+      const alertMinutes = Number(settings.alert_before_minutes) || 20;
+      const checkAt = new Date(Date.UTC(2000, 0, 1, departureHour, departureMinute - alertMinutes));
+      const targetTime = `${String(checkAt.getUTCHours()).padStart(2, '0')}:${String(checkAt.getUTCMinutes()).padStart(2, '0')}`;
+      const week = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+      const targetDay =
+        departureHour * 60 + departureMinute < alertMinutes
+          ? week[(week.indexOf(now.weekday) + 1) % week.length]
+          : now.weekday;
+      if (
+        settings.home &&
+        settings.office &&
+        (settings.days || []).includes(targetDay) &&
+        now.hour + ':' + now.minute === targetTime &&
+        settings.last_scheduled_minute !== now.stamp
+      ) {
+        await writeSettings(userId, { ...settings, last_scheduled_minute: now.stamp });
+        const result = await runCheck(userId, true);
+        await sendPushNotifications(userId, result);
+      }
     }
   } catch (error) {
     console.error('Schedule check failed:', error.message);
   }
 }
 
-function send(response, status, payload, type = 'application/json; charset=utf-8') {
+function send(response, status, payload, type = 'application/json; charset=utf-8', headers = {}) {
   const data = Buffer.isBuffer(payload) ? payload : Buffer.from(JSON.stringify(payload));
   response.writeHead(status, {
     'Content-Type': type,
@@ -445,6 +637,7 @@ function send(response, status, payload, type = 'application/json; charset=utf-8
     'Cache-Control': type.includes('json') ? 'no-store' : 'public, max-age=300',
     'X-Content-Type-Options': 'nosniff',
     'Access-Control-Allow-Origin': process.env.CORS_ORIGIN || '*',
+    ...headers,
   });
   response.end(data);
 }
@@ -469,8 +662,84 @@ async function handle(request, response) {
       });
       return response.end();
     }
+    if (request.method === 'GET' && url.pathname === '/health')
+      return send(response, 200, { ok: true });
+    if (request.method === 'GET' && url.pathname === '/api/auth/me') {
+      const user = authenticatedUser(request);
+      return send(response, 200, { user: user ? { username: user.username } : null });
+    }
+    if (
+      request.method === 'POST' &&
+      ['/api/auth/register', '/api/auth/login'].includes(url.pathname)
+    ) {
+      const body = await readBody(request);
+      const username = String(body.username || '')
+        .trim()
+        .toLowerCase();
+      const password = String(body.password || '');
+      if (!/^[a-z0-9._-]{3,32}$/u.test(username))
+        return send(response, 400, {
+          error: 'Username must be 3–32 characters: letters, numbers, dot, dash, or underscore.',
+        });
+      if (password.length < 10 || password.length > 200)
+        return send(response, 400, { error: 'Password must be at least 10 characters.' });
+      const store = await readStore();
+      let user = Object.values(store.users).find((entry) => entry.username === username);
+      if (url.pathname.endsWith('/register')) {
+        if (user) return send(response, 409, { error: 'That username is already in use.' });
+        const passwordData = await hashPassword(password);
+        user = {
+          id: randomUUID(),
+          username,
+          password_salt: passwordData.salt,
+          password_hash: passwordData.hash,
+          settings: { ...DEFAULTS },
+        };
+        store.users[user.id] = user;
+        await writeStore(store);
+      } else if (!user || !(await verifyPassword(password, user))) {
+        return send(response, 401, { error: 'Username or password is incorrect.' });
+      }
+      const token = createSession(user);
+      return send(
+        response,
+        200,
+        { user: { username: user.username } },
+        'application/json; charset=utf-8',
+        { 'Set-Cookie': sessionCookie(token) },
+      );
+    }
+    if (request.method === 'POST' && url.pathname === '/api/auth/logout') {
+      const token = parseCookies(request).commute_session;
+      if (token) sessions.delete(token);
+      return send(response, 200, { ok: true }, 'application/json; charset=utf-8', {
+        'Set-Cookie': sessionCookie('', 0),
+      });
+    }
+    const user = authenticatedUser(request);
+    if (url.pathname.startsWith('/api/') && !url.pathname.startsWith('/api/auth/') && !user)
+      return send(response, 401, { error: 'Sign in to continue.' });
+    if (request.method === 'GET' && url.pathname === '/api/push/key')
+      return send(response, 200, { publicKey: process.env.VAPID_PUBLIC_KEY || null });
+    if (request.method === 'POST' && url.pathname === '/api/push/subscribe') {
+      const subscription = await readBody(request);
+      if (
+        !String(subscription.endpoint || '').startsWith('https://') ||
+        !subscription.keys?.p256dh ||
+        !subscription.keys?.auth
+      )
+        return send(response, 400, { error: 'Invalid push subscription.' });
+      const settings = await readSettings(user.id);
+      const subscriptions = settings.push_subscriptions || [];
+      settings.push_subscriptions = [
+        ...subscriptions.filter((entry) => entry.endpoint !== subscription.endpoint),
+        subscription,
+      ];
+      await writeSettings(user.id, settings);
+      return send(response, 200, { ok: true });
+    }
     if (request.method === 'GET' && url.pathname === '/api/settings')
-      return send(response, 200, await readSettings());
+      return send(response, 200, await readSettings(user.id));
     if (request.method === 'GET' && url.pathname === '/api/lookup') {
       const query = url.searchParams.get('q')?.trim();
       if (!query) return send(response, 400, { error: 'Enter an address or stop.' });
@@ -484,8 +753,12 @@ async function handle(request, response) {
       const journey = (route.journeys || route.trips || [])[0];
       const routeLines = extractLines(route);
       const routeStops = extractStops(journey);
-      const settings = await readSettings();
-      await writeSettings({ ...settings, route_lines: routeLines, route_stops: routeStops });
+      const settings = await readSettings(user.id);
+      await writeSettings(user.id, {
+        ...settings,
+        route_lines: routeLines,
+        route_stops: routeStops,
+      });
       return send(response, 200, {
         route_lines: routeLines,
         route_stops: routeStops,
@@ -493,11 +766,11 @@ async function handle(request, response) {
       });
     }
     if (request.method === 'GET' && url.pathname === '/api/check')
-      return send(response, 200, await runCheck());
+      return send(response, 200, await runCheck(user.id));
     if (request.method === 'POST') {
       const body = await readBody(request);
       if (url.pathname === '/api/settings') {
-        const current = await readSettings();
+        const current = await readSettings(user.id);
         const updated = { ...current, ...body };
         const configFields = [
           'home_location',
@@ -516,7 +789,7 @@ async function handle(request, response) {
           updated.last_check = null;
           updated.last_scheduled_minute = null;
         }
-        const saved = await writeSettings(updated);
+        const saved = await writeSettings(user.id, updated);
         return send(response, 200, { ...saved, configuration_changed: configurationChanged });
       }
     }
