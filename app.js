@@ -4,7 +4,6 @@ let knownResultAt = null;
 let locations = { home: null, office: null };
 let searchTimers = {};
 let formTouched = new Set();
-let authMode = 'register';
 const sessionStartedAt = Date.now();
 const $ = (id) => document.getElementById(id);
 
@@ -97,7 +96,7 @@ function showStatus(result) {
     ? result.ai_assessment
       ? `AI assessment · ${result.ai_assessment.severity} · ${result.ai_assessment.affected ? 'route affected' : 'route impact unclear'} · ${result.ai_assessment.recommendation.replaceAll('_', ' ')}`
       : result.assessment_mode === 'rules'
-        ? 'Rule-based assessment · Claude is not configured or could not be reached.'
+        ? 'Rule-based assessment · Gemini is not configured or could not be reached.'
         : ''
     : '';
   if (!result) {
@@ -164,6 +163,9 @@ function showStatus(result) {
     icon.textContent = '?';
     icon.classList.add('unknown');
     $('uberLink').classList.add('hidden');
+  }
+  if (result.ai_assessment?.headline) {
+    $('statusTitle').textContent = result.ai_assessment.headline;
   }
   if (result.ai_assessment?.notification) {
     $('statusSummary').textContent = result.ai_assessment.notification;
@@ -262,7 +264,6 @@ async function saveSettings() {
     $('serverStatus').classList.add('on');
     if ('Notification' in window && Notification.permission === 'default')
       await Notification.requestPermission();
-    await subscribeForPush();
     alert(
       `Commute saved. The SL check is scheduled for ${alertBefore} minutes before departure. Delays up to ${delayBuffer} minutes are okay before the app suggests Uber. ${route.route_lines.length ? `The planner found ${route.route_lines.length} line(s) on your route.` : 'The planner did not return line details; the alert will avoid claiming a clear result if it cannot estimate the route.'}`,
     );
@@ -274,14 +275,18 @@ async function saveSettings() {
 async function checkNow() {
   const button = $('checkNow');
   button.disabled = true;
-  button.textContent = 'Checking…';
+  button.querySelector('.spinner').classList.remove('hidden');
+  $('checkNowLabel').textContent = 'Checking…';
+  $('checkingStatus').classList.remove('hidden');
   try {
     showStatus(await request('/api/check'));
   } catch (error) {
     showStatus({ status: 'unknown', error: error.message });
   } finally {
     button.disabled = false;
-    button.textContent = 'Check SL now';
+    button.querySelector('.spinner').classList.add('hidden');
+    $('checkNowLabel').textContent = 'Check SL now';
+    $('checkingStatus').classList.add('hidden');
   }
 }
 
@@ -298,18 +303,11 @@ async function poll() {
         'Notification' in window &&
         Notification.permission === 'granted'
       ) {
-        const title =
-          result.status === 'delay'
-            ? 'Tough start for the day'
-            : result.status === 'clear'
-              ? 'Everything good'
-              : 'SL commute update';
+        const title = result.ai_assessment?.headline || 'SL commute update';
         const body =
-          result.status === 'delay'
-            ? `Tough start for the day, but we try to make it nice with a UBER ride. SL estimates ${result.predicted_delay_minutes} minutes. Review and confirm in Uber.`
-            : result.status === 'clear'
-              ? 'Everything good—have a pleasant trip and a wonderful day!'
-              : result.note || 'Open the agent for details.';
+          result.ai_assessment?.notification ||
+          result.note ||
+          'Open the commute agent for the latest route status.';
         new Notification(title, { body });
       }
       knownResultAt = result.checked_at;
@@ -328,10 +326,15 @@ async function shareAlert() {
     .map((item) => item.header)
     .filter(Boolean)
     .join('; ');
-  const text =
-    result?.status === 'delay'
-      ? `Tough start for the day: SL estimates a ${result.predicted_delay_minutes}-minute delay from ${selectedName(locations.home)} to ${selectedName(locations.office)}.${notices ? ` SL notice: ${notices}.` : ''} A fake demo Uber ride was created locally; open Uber to review and confirm a real ride.`
-      : `SL commute update: ${$('statusSummary').textContent}${notices ? ` SL notice: ${notices}.` : ''}`;
+  const text = [
+    result?.ai_assessment?.notification || $('statusSummary').textContent,
+    notices && `SL notices: ${notices}.`,
+    result?.status === 'delay' &&
+      result.fake_uber_booking &&
+      `A demo Uber ride (${result.fake_uber_booking.booking_reference}) was prepared locally; open Uber to review and confirm a real ride.`,
+  ]
+    .filter(Boolean)
+    .join(' ');
   if (navigator.share) {
     try {
       await navigator.share({
@@ -420,78 +423,4 @@ function init() {
   setInterval(poll, 5000);
 }
 
-async function subscribeForPush() {
-  if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
-  try {
-    const { publicKey } = await request('/api/push/key');
-    if (!publicKey || Notification.permission !== 'granted') return;
-    const registration = await navigator.serviceWorker.ready;
-    let subscription = await registration.pushManager.getSubscription();
-    if (!subscription) {
-      const keyBytes = Uint8Array.from(
-        atob(publicKey.replace(/-/gu, '+').replace(/_/gu, '/')),
-        (char) => char.charCodeAt(0),
-      );
-      subscription = await registration.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: keyBytes,
-      });
-    }
-    await request('/api/push/subscribe', { method: 'POST', body: JSON.stringify(subscription) });
-  } catch (error) {
-    console.warn('Push notifications are not enabled:', error.message);
-  }
-}
-
-function showAuth(mode = 'register') {
-  authMode = mode;
-  $('appShell').classList.add('hidden');
-  $('authPanel').classList.remove('hidden');
-  $('authTitle').textContent = mode === 'register' ? 'Create your account' : 'Welcome back';
-  $('authSubmit').textContent = mode === 'register' ? 'Create account' : 'Sign in';
-  $('authMode').textContent =
-    mode === 'register' ? 'Already have an account? Sign in' : 'New here? Create an account';
-  $('authPassword').autocomplete = mode === 'register' ? 'new-password' : 'current-password';
-}
-
-async function startApp() {
-  $('authMode').addEventListener('click', () =>
-    showAuth(authMode === 'register' ? 'login' : 'register'),
-  );
-  $('authForm').addEventListener('submit', async (event) => {
-    event.preventDefault();
-    $('authError').textContent = '';
-    $('authSubmit').disabled = true;
-    try {
-      await request(`/api/auth/${authMode}`, {
-        method: 'POST',
-        body: JSON.stringify({
-          username: $('authUsername').value,
-          password: $('authPassword').value,
-        }),
-      });
-      window.location.reload();
-    } catch (error) {
-      $('authError').textContent = error.message;
-    } finally {
-      $('authSubmit').disabled = false;
-    }
-  });
-  $('logout').addEventListener('click', async () => {
-    await request('/api/auth/logout', { method: 'POST', body: '{}' });
-    window.location.reload();
-  });
-  try {
-    const { user } = await request('/api/auth/me');
-    if (!user) return showAuth();
-    $('accountName').textContent = user.username;
-    $('authPanel').classList.add('hidden');
-    $('appShell').classList.remove('hidden');
-    init();
-  } catch {
-    showAuth();
-    $('authError').textContent = 'Could not connect to the commute service.';
-  }
-}
-
-startApp();
+init();
