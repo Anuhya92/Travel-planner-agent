@@ -1,45 +1,37 @@
-# SL Commute Agent
+# SL Commute Agent — laptop prototype
 
-The project is packaged as a responsive web app, an installable PWA, and Capacitor shells for Android and iOS. The web service is a single-user beta: commute settings live in `commute.json` on the server. Do not expose it as a public multi-user service until authentication, per-user storage, and protected settings APIs are added.
+A local Node.js prototype with separate accounts and commute profiles. It checks SL route notices around each signed-in user's travel window, asks Gemini to assess relevant disruptions and explain what to do, and can create a clearly labeled fake Uber ride when the delay exceeds the user's buffer. It does not place a real taxi order.
 
-## Run locally
+## G-pass business challenge
+
+**Challenge:** SL disruptions can make employees late when they learn about a problem only after starting their commute. **Outcome:** help commuters make an informed decision before departure and improve the chance of arriving at work on time. The agent uses the chosen route, travel window, live SL journey estimate, and matching notices to produce a route-specific status; when a delay exceeds the commuter's buffer, it prepares a simulated taxi option for review. This is a functional laptop prototype of that workflow, not a measured claim that lateness has already been reduced.
+
+## Run on your laptop
 
 1. Install Node.js 20 or later.
-2. Run `npm start` or double-click `start.bat`.
-3. Open `http://127.0.0.1:8765`, choose home and work suggestions, set the departure schedule, and save.
+2. Copy `.env.example` to `.env` and put your Gemini API key in `GEMINI_API_KEY`.
+3. Run `npm install` once.
+4. Double-click `start.bat`, or run `npm start`.
+5. Open the dashboard, choose **Create an account**, and set a username and password. Sign in on later visits with those credentials.
+6. Keep the server window and dashboard tab open for scheduled checks and browser notifications.
 
-The service binds to `0.0.0.0` and uses `PORT` if supplied by a hosting provider. Persistent storage must be mounted for `commute.json`; the included Dockerfile is a starting point, not a complete production deployment. Configure HTTPS at the hosting layer. Schedule checks run inside the Node process, so a host that sleeps or restarts needs an external scheduler for reliable alerts.
+The local server binds only to `127.0.0.1`, so accounts are available on this laptop only. Commute details and salted scrypt password hashes are saved in `commute.json`; `.gitignore` excludes that file and `.env` from Git. Sessions are held in memory and expire when the server restarts, so sign in again after a restart. If you already had a saved commute before adding accounts, the first account created adopts that profile; later accounts get their own separate settings.
 
-## Install as a web app
+## Gemini assessment
 
-Deploy to an HTTPS domain, open it in Safari on iOS or Chrome on Android, then use the browser's **Add to Home Screen / Install app** action. The PWA caches its app shell for quicker loading. The live API and scheduled checks still need an internet connection and a running server.
+The server calls Gemini's `generateContent` REST API with structured JSON output (`responseMimeType` and `responseJsonSchema`). It sends your selected route's stop and line names, travel window, delay buffer, and matching SL notice text to Google. Gemini judges route impact and writes the user-facing headline and notification. The API key stays on the laptop in `.env` and is never sent to the browser. The model defaults to `gemini-3.8-flash`; set `GEMINI_MODEL` to use another compatible model. If Gemini returns a 503, the agent automatically tries an alternate Flash model: `gemini-3.1-flash-lite` when the primary is `gemini-3.5-flash-lite`, otherwise `gemini-3.5-flash-lite`. Set `GEMINI_FALLBACK_MODEL` to choose another compatible fallback. If both models fail or the key is missing, the app labels the result as AI-unavailable and shows the SL/journey result without claiming an AI assessment.
+
+## Local behavior and limits
+
+- Address suggestions, route estimates, and disruption notices use SL's public journey and deviations APIs.
+- Route matching considers the selected route, notice scope, published validity, explicit clock ranges, and reported delay text.
+- **Alert before** sets when the local process checks your commute. **Delay buffer** sets how many minutes of delay you are willing to accept before a demo Uber ride is shown.
+- Browser notifications require the dashboard to remain open and notification permission to be enabled. The laptop must be awake and the Node process running at check time.
+- The simulated Uber booking is only a local demo record; no Uber request, driver, charge, or invoice is created.
+- Accounts demonstrate credential-based access and per-user data separation on the laptop; they do not make this local prototype reachable to remote users.
 
 ## Code quality
 
-Run `npm install` to install project dependencies. Use `npm run lint` to check JavaScript, `npm run lint:fix` to apply safe ESLint fixes, `npm run format` to format project files with Prettier, or `npm run format:check` to check formatting without changing files.
-
-## iOS and Android native shells
-
-The Capacitor config points at the hosted web app. Set `server.url` in `capacitor.config.json` to the deployed HTTPS domain. Then run:
-
-```sh
-npm install
-npx cap add ios
-npx cap add android
-npx cap sync
-npx cap open ios
-npx cap open android
-```
-
-iOS builds require macOS and Xcode. Android builds require Android Studio and its SDK. The generated apps are WebView shells around the hosted service; native push notifications and app-store signing are not configured yet. Browser notifications require the web page to be available, so the current schedule does not guarantee background mobile alerts. Reliable iOS and Android alerts need per-user accounts, device registration, push services, and a hosted scheduler.
-
-## Current behavior
-
-- SL Journey Planner autocomplete and route estimates; SL Deviations route and travel-window matching.
-- Explicit SL notice clock ranges are checked against the expected travel window.
-- A local simulated Uber ride record is created when the estimated delay exceeds the configured threshold. It never contacts Uber, dispatches a driver, or charges anyone.
-- The Uber link opens a prefilled real ride for the user to review and confirm.
-
-## Before a public launch
-
-Implement user sign-in and per-user encrypted settings storage, secure API access, cloud persistence, a scheduled worker, push notification enrollment and delivery, and production monitoring. Add account deletion and data retention controls. Native app releases also need signing credentials and store review.
+- `npm run lint` checks JavaScript.
+- `npm run format` formats the project.
+- `npm run format:check` checks formatting.

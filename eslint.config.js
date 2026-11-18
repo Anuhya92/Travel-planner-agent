@@ -3,11 +3,11 @@ import globals from 'globals';
 
 export default [
   {
-    ignores: ['node_modules/**', 'www/**', 'android/**', 'ios/**', 'commute.json'],
+    ignores: ['node_modules/**', 'commute.json'],
   },
   js.configs.recommended,
   {
-    files: ['server.mjs', 'eslint.config.js', 'capacitor.config.json'],
+    files: ['server.mjs', 'eslint.config.js'],
     languageOptions: {
       globals: globals.node,
       ecmaVersion: 'latest',
@@ -15,7 +15,7 @@ export default [
     },
   },
   {
-    files: ['app.js', 'sw.js'],
+    files: ['app.js'],
     languageOptions: {
       globals: { ...globals.browser, ...globals.serviceworker },
       ecmaVersion: 'latest',

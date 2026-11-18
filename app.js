@@ -6,6 +6,7 @@ let searchTimers = {};
 let formTouched = new Set();
 const sessionStartedAt = Date.now();
 const $ = (id) => document.getElementById(id);
+let authMode = 'login';
 
 async function request(url, options = {}) {
   const response = await fetch(url, {
@@ -92,7 +93,17 @@ async function searchLocations(side, query) {
 }
 
 function showStatus(result) {
+  $('assessmentMeta').textContent = !result
+    ? ''
+    : result.ai_assessment
+      ? `AI assessment · ${result.ai_assessment.model} · ${result.ai_assessment.severity} · ${result.ai_assessment.affected ? 'route affected' : 'route impact unclear'} · ${result.ai_assessment.recommendation.replaceAll('_', ' ')}`
+      : result.assessment_mode === 'rules'
+        ? `AI assessment unavailable · ${result.ai_error || 'Showing the SL and journey-planner result.'}`
+        : '';
   if (!result) {
+    $('disruptionList').replaceChildren();
+    $('bookingNote').classList.add('hidden');
+    $('checkedAt').textContent = '';
     if (settings.home_location && settings.office_location) {
       $('statusTitle').textContent = 'Ready to check your route';
       $('statusSummary').textContent =
@@ -136,7 +147,7 @@ function showStatus(result) {
     const booking = result.fake_uber_booking;
     $('bookingNote').innerHTML = booking
       ? `<strong>Demo Uber ride booked automatically</strong><br>Reference: ${escapeHtml(booking.booking_reference)}<br>${escapeHtml(booking.product)} · pickup ${escapeHtml(new Date(booking.pickup_time).toLocaleTimeString('sv-SE', { timeZone: 'Europe/Stockholm', hour: '2-digit', minute: '2-digit' }))}<br>${escapeHtml(booking.pickup)} → ${escapeHtml(booking.destination)}<br>${escapeHtml(booking.driver)} · ${escapeHtml(booking.vehicle)} · ${escapeHtml(booking.eta_minutes)} min ETA<br><span class="fineprint">${escapeHtml(booking.note)}</span>`
-      : 'A demo ride will be created when a delay above your threshold is detected.';
+      : 'No demo ride was created: SL has not reported a positive delay above your buffer.';
   } else if (result.status === 'caution') {
     $('statusTitle').textContent = 'SL notice on your route';
     $('statusSummary').textContent =
@@ -153,6 +164,12 @@ function showStatus(result) {
     icon.textContent = '?';
     icon.classList.add('unknown');
     $('uberLink').classList.add('hidden');
+  }
+  if (result.ai_assessment?.headline) {
+    $('statusTitle').textContent = result.ai_assessment.headline;
+  }
+  if (result.ai_assessment?.notification) {
+    $('statusSummary').textContent = result.ai_assessment.notification;
   }
 
   for (const item of result.disruptions || []) {
@@ -213,6 +230,7 @@ async function saveSettings() {
         : [...$('daysCustom').querySelectorAll('input:checked')].map((input) => input.value);
   if (!days.length) return alert('Choose at least one day.');
   const alertBefore = Math.max(5, Math.min(120, Number($('alertBefore').value) || 20));
+  const delayBuffer = Math.max(0, Math.min(120, Number($('delayBuffer').value) || 0));
   const payload = {
     home: locationTitle(home),
     office: locationTitle(office),
@@ -220,10 +238,19 @@ async function saveSettings() {
     office_location: office,
     departure_time: $('departureTime').value || '08:00',
     alert_before_minutes: alertBefore,
+    delay_buffer_minutes: delayBuffer,
     days,
   };
   try {
-    await request('/api/settings', { method: 'POST', body: JSON.stringify(payload) });
+    const saved = await request('/api/settings', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    settings = saved;
+    if (saved.configuration_changed) {
+      knownResultAt = null;
+      showStatus(null);
+    }
     const route = await request(
       `/api/route?origin=${encodeURIComponent(home.id || home.name)}&destination=${encodeURIComponent(office.id || office.name)}`,
     );
@@ -234,12 +261,12 @@ async function saveSettings() {
       route_stops: route.route_stops,
     };
     updateUberLink();
-    $('serverStatus').textContent = `Alert ${alertBefore} min before departure`;
+    $('serverStatus').textContent = `Alert ${alertBefore} min before · ${delayBuffer} min buffer`;
     $('serverStatus').classList.add('on');
     if ('Notification' in window && Notification.permission === 'default')
       await Notification.requestPermission();
     alert(
-      `Commute saved. The SL check is scheduled for ${alertBefore} minutes before departure. ${route.route_lines.length ? `The planner found ${route.route_lines.length} line(s) on your route.` : 'The planner did not return line details; the alert will avoid claiming a clear result if it cannot estimate the route.'}`,
+      `Commute saved. The SL check is scheduled for ${alertBefore} minutes before departure. Delays up to ${delayBuffer} minutes are okay before the app suggests Uber. ${route.route_lines.length ? `The planner found ${route.route_lines.length} line(s) on your route.` : 'The planner did not return line details; the alert will avoid claiming a clear result if it cannot estimate the route.'}`,
     );
   } catch (error) {
     alert(error.message);
@@ -249,14 +276,18 @@ async function saveSettings() {
 async function checkNow() {
   const button = $('checkNow');
   button.disabled = true;
-  button.textContent = 'Checking…';
+  button.querySelector('.spinner').classList.remove('hidden');
+  $('checkNowLabel').textContent = 'Checking…';
+  $('checkingStatus').classList.remove('hidden');
   try {
     showStatus(await request('/api/check'));
   } catch (error) {
     showStatus({ status: 'unknown', error: error.message });
   } finally {
     button.disabled = false;
-    button.textContent = 'Check SL now';
+    button.querySelector('.spinner').classList.add('hidden');
+    $('checkNowLabel').textContent = 'Check SL now';
+    $('checkingStatus').classList.add('hidden');
   }
 }
 
@@ -273,18 +304,11 @@ async function poll() {
         'Notification' in window &&
         Notification.permission === 'granted'
       ) {
-        const title =
-          result.status === 'delay'
-            ? 'Tough start for the day'
-            : result.status === 'clear'
-              ? 'Everything good'
-              : 'SL commute update';
+        const title = result.ai_assessment?.headline || 'SL commute update';
         const body =
-          result.status === 'delay'
-            ? `Tough start for the day, but we try to make it nice with a UBER ride. SL estimates ${result.predicted_delay_minutes} minutes. Review and confirm in Uber.`
-            : result.status === 'clear'
-              ? 'Everything good—have a pleasant trip and a wonderful day!'
-              : result.note || 'Open the agent for details.';
+          result.ai_assessment?.notification ||
+          result.note ||
+          'Open the commute agent for the latest route status.';
         new Notification(title, { body });
       }
       knownResultAt = result.checked_at;
@@ -303,10 +327,15 @@ async function shareAlert() {
     .map((item) => item.header)
     .filter(Boolean)
     .join('; ');
-  const text =
-    result?.status === 'delay'
-      ? `Tough start for the day: SL estimates a ${result.predicted_delay_minutes}-minute delay from ${selectedName(locations.home)} to ${selectedName(locations.office)}.${notices ? ` SL notice: ${notices}.` : ''} A fake demo Uber ride was created locally; open Uber to review and confirm a real ride.`
-      : `SL commute update: ${$('statusSummary').textContent}${notices ? ` SL notice: ${notices}.` : ''}`;
+  const text = [
+    result?.ai_assessment?.notification || $('statusSummary').textContent,
+    notices && `SL notices: ${notices}.`,
+    result?.status === 'delay' &&
+      result.fake_uber_booking &&
+      `A demo Uber ride (${result.fake_uber_booking.booking_reference}) was prepared locally; open Uber to review and confirm a real ride.`,
+  ]
+    .filter(Boolean)
+    .join(' ');
   if (navigator.share) {
     try {
       await navigator.share({
@@ -348,7 +377,7 @@ function init() {
   $('checkNow').addEventListener('click', checkNow);
   $('saveSettings').addEventListener('click', saveSettings);
   $('shareAlert').addEventListener('click', shareAlert);
-  for (const id of ['departureTime', 'alertBefore', 'dayPreset'])
+  for (const id of ['departureTime', 'alertBefore', 'delayBuffer', 'dayPreset'])
     $(id).addEventListener('input', () => formTouched.add('schedule'));
   $('dayPreset').addEventListener('change', () =>
     $('daysCustom').classList.toggle('hidden', $('dayPreset').value !== 'custom'),
@@ -370,6 +399,7 @@ function init() {
         $('departureTime').value =
           saved.departure_time || (saved.check_time ? saved.check_time : '08:00');
         $('alertBefore').value = saved.alert_before_minutes || 20;
+        $('delayBuffer').value = saved.delay_buffer_minutes ?? saved.alert_before_minutes ?? 20;
       }
       const selectedDays = saved.days || DAYS.slice(0, 5);
       if (selectedDays.length === 7) $('dayPreset').value = 'everyday';
@@ -393,4 +423,69 @@ function init() {
   poll();
   setInterval(poll, 5000);
 }
-init();
+
+function showAuth(mode = 'login') {
+  authMode = mode;
+  $('appShell').classList.add('hidden');
+  $('authPanel').classList.remove('hidden');
+  $('authTitle').textContent = mode === 'register' ? 'Create your account' : 'Sign in';
+  $('authSubmit').textContent = mode === 'register' ? 'Create account' : 'Sign in';
+  $('authMode').textContent =
+    mode === 'register' ? 'Already have an account? Sign in' : 'New here? Create an account';
+  $('authPassword').autocomplete = mode === 'register' ? 'new-password' : 'current-password';
+  $('authHint').textContent =
+    mode === 'register'
+      ? 'Usernames use 3–32 letters, numbers, dots, dashes or underscores. Passwords need at least 10 characters.'
+      : 'Use your username and password to open your commute.';
+  $('authError').textContent = '';
+}
+
+function showApp(user) {
+  $('authPanel').classList.add('hidden');
+  $('appShell').classList.remove('hidden');
+  $('accountName').textContent = user.username;
+  init();
+}
+
+async function startApp() {
+  $('authMode').addEventListener('click', () =>
+    showAuth(authMode === 'register' ? 'login' : 'register'),
+  );
+  $('authForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    $('authError').textContent = '';
+    $('authSubmit').disabled = true;
+    try {
+      const result = await request(`/api/auth/${authMode === 'register' ? 'register' : 'login'}`, {
+        method: 'POST',
+        body: JSON.stringify({
+          username: $('authUsername').value,
+          password: $('authPassword').value,
+        }),
+      });
+      showApp(result.user);
+    } catch (error) {
+      $('authError').textContent = error.message;
+    } finally {
+      $('authSubmit').disabled = false;
+    }
+  });
+  $('logout').addEventListener('click', async () => {
+    try {
+      await request('/api/auth/logout', { method: 'POST', body: '{}' });
+      window.location.reload();
+    } catch (error) {
+      alert(error.message);
+    }
+  });
+  try {
+    const { user } = await request('/api/auth/me');
+    if (user) showApp(user);
+    else showAuth();
+  } catch (error) {
+    showAuth();
+    $('authError').textContent = `Could not connect to the local commute service: ${error.message}`;
+  }
+}
+
+startApp();

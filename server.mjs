@@ -1,17 +1,32 @@
 import http from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
+try {
+  const envFile = await readFile(path.join(ROOT, '.env'), 'utf8');
+  for (const line of envFile.split(/\r?\n/u)) {
+    const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/u);
+    if (match && !match[2].startsWith('#') && process.env[match[1]] === undefined) {
+      process.env[match[1]] = match[2].replace(
+        /^(?:"(.*)"|'(.*)')$/u,
+        (_, doubleQuoted, singleQuoted) => doubleQuoted ?? singleQuoted,
+      );
+    }
+  }
+} catch (error) {
+  if (error.code !== 'ENOENT') throw error;
+}
 const DATA = path.join(ROOT, 'commute.json');
 const TZ = 'Europe/Stockholm';
-const HOST = process.env.HOST || '0.0.0.0';
-const PORT = Number(process.env.PORT || 8765);
+const HOST = '127.0.0.1';
+const PORT = Number(process.env.PORT) || 8765;
 const SL_API = 'https://deviations.integration.sl.se/v1/messages';
 const PLANNER = 'https://journeyplanner.integration.sl.se/v2';
-const FILTER_VERSION = 3;
+const FILTER_VERSION = 6;
 const DEFAULTS = {
   home: '',
   office: '',
@@ -19,6 +34,7 @@ const DEFAULTS = {
   office_location: null,
   departure_time: '08:00',
   alert_before_minutes: 20,
+  delay_buffer_minutes: 20,
   days: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'],
   line_ids: '',
   route_lines: [],
@@ -27,28 +43,84 @@ const DEFAULTS = {
   last_check: null,
   last_result: null,
 };
-let checking = false;
+const scrypt = promisify(scryptCallback);
+const SESSION_COOKIE = 'sl_commute_session';
+const SESSION_MAX_AGE = 60 * 60 * 24 * 14;
+const sessions = new Map();
+const checking = new Set();
+let storeQueue = Promise.resolve();
 
-async function readSettings() {
+async function readStore() {
   try {
-    const settings = { ...DEFAULTS, ...JSON.parse(await readFile(DATA, 'utf8')) };
-    if (settings.last_result && settings.last_result.filter_version !== FILTER_VERSION) {
-      settings.last_result = null;
-      settings.last_check = null;
+    const stored = JSON.parse(await readFile(DATA, 'utf8'));
+    if (stored.users && typeof stored.users === 'object') {
+      return { users: stored.users, legacy_settings: stored.legacy_settings || null };
     }
-    return settings;
-  } catch {
-    return { ...DEFAULTS };
+    return { users: {}, legacy_settings: { ...DEFAULTS, ...stored } };
+  } catch (error) {
+    if (error.code === 'ENOENT') return { users: {}, legacy_settings: null };
+    return { users: {}, legacy_settings: null };
   }
 }
 
-async function writeSettings(value) {
+async function updateStore(update) {
+  const operation = storeQueue.then(async () => {
+    const store = await readStore();
+    const result = await update(store);
+    await writeFile(DATA, JSON.stringify(store, null, 2), 'utf8');
+    return result;
+  });
+  storeQueue = operation.catch(() => {});
+  return operation;
+}
+
+async function readSettings(userId) {
+  const store = await readStore();
+  const user = store.users[userId];
+  if (!user) return null;
+  const settings = { ...DEFAULTS, ...user.settings };
+  if (settings.last_result && settings.last_result.filter_version !== FILTER_VERSION) {
+    settings.last_result = null;
+    settings.last_check = null;
+  }
+  return settings;
+}
+
+async function writeSettings(userId, value) {
   const safe = { ...DEFAULTS, ...value };
-  await writeFile(DATA, JSON.stringify(safe, null, 2), 'utf8');
+  await updateStore((store) => {
+    if (!store.users[userId]) throw new Error('Account not found. Please sign in again.');
+    store.users[userId].settings = safe;
+  });
   return safe;
 }
 
-async function fetchJson(url, { method = 'GET', body, headers = {} } = {}) {
+function sessionUser(request) {
+  const token = request.headers.cookie
+    ?.split(';')
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(`${SESSION_COOKIE}=`))
+    ?.slice(SESSION_COOKIE.length + 1);
+  return token ? sessions.get(token) || null : null;
+}
+
+function sessionCookie(token, maxAge = SESSION_MAX_AGE) {
+  return `${SESSION_COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}`;
+}
+
+function publicUser(user) {
+  return user ? { id: user.id, username: user.username } : null;
+}
+
+async function createAccountSession(response, user) {
+  const token = randomBytes(32).toString('base64url');
+  sessions.set(token, user.id);
+  send(response, 200, { user: publicUser(user) }, 'application/json; charset=utf-8', {
+    'Set-Cookie': sessionCookie(token),
+  });
+}
+
+async function fetchJson(url, { method = 'GET', body, headers = {}, timeoutMs = 18_000 } = {}) {
   const response = await fetch(url, {
     method,
     headers: {
@@ -57,7 +129,7 @@ async function fetchJson(url, { method = 'GET', body, headers = {} } = {}) {
       ...headers,
     },
     ...(body ? { body: JSON.stringify(body) } : {}),
-    signal: AbortSignal.timeout(18000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   const text = await response.text();
   let data;
@@ -66,8 +138,13 @@ async function fetchJson(url, { method = 'GET', body, headers = {} } = {}) {
   } catch {
     data = { message: text };
   }
-  if (!response.ok)
-    throw new Error(data.message || data.error || `Request failed (${response.status})`);
+  if (!response.ok) {
+    const detail =
+      data.message || data.error?.message || data.error || `Request failed (${response.status})`;
+    const error = new Error(`${response.status} ${response.statusText}: ${detail}`);
+    error.status = response.status;
+    throw error;
+  }
   return data;
 }
 
@@ -208,6 +285,125 @@ function timeRangeOverlapsWindow(ranges, window) {
   });
 }
 
+function reportedDelayMinutes(message) {
+  const text = (message.message_variants || [])
+    .map((variant) => `${variant.header || ''} ${variant.details || ''}`)
+    .join(' ');
+  const patterns = [
+    /(?:ca\.?|cirka|approximately|about|around)?\s*(\d{1,3})\s*(?:minut(?:er)?|minutes?|mins?)\s*(?:sent|late|försenad|försenat|försenade)/giu,
+    /(?:försenad|försenat|försenade|delay(?:ed)?(?:\s+by)?)\s*(?:ca\.?|cirka|approximately|about)?\s*(\d{1,3})\s*(?:minut(?:er)?|minutes?|mins?)/giu,
+  ];
+  let maxDelay = 0;
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      maxDelay = Math.max(maxDelay, Number(match[1]) || 0);
+    }
+  }
+  return maxDelay;
+}
+
+function describeGeminiError(error) {
+  const timedOut = error.name === 'TimeoutError' || /aborted due to timeout/iu.test(error.message);
+  return timedOut
+    ? 'Gemini did not respond within 60 seconds. The commute result is shown without an AI assessment.'
+    : error.message;
+}
+
+async function assessWithGemini({
+  route,
+  window,
+  notices,
+  predictedDelayMinutes,
+  delayBuffer,
+  model = process.env.GEMINI_MODEL || 'gemini-3.8-flash',
+}) {
+  if (!process.env.GEMINI_API_KEY) return null;
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['severity', 'affected', 'recommendation', 'reason', 'headline', 'notification'],
+    properties: {
+      severity: { type: 'string', enum: ['low', 'moderate', 'high', 'critical'] },
+      affected: { type: 'boolean' },
+      recommendation: { type: 'string', enum: ['continue', 'leave_early', 'taxi', 'check_sl'] },
+      reason: { type: 'string' },
+      headline: { type: 'string' },
+      notification: { type: 'string' },
+    },
+  };
+  const response = await fetchJson(
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+    {
+      method: 'POST',
+      headers: {
+        'x-goog-api-key': process.env.GEMINI_API_KEY,
+      },
+      timeoutMs: 60_000,
+      body: {
+        systemInstruction: {
+          parts: [
+            {
+              text: [
+                'You are a Stockholm public-transport commute disruption analyst.',
+                'Use only the supplied SL notices and route data. Do not invent closures, delays, or alternatives.',
+                'Assess whether the affected lines and stops overlap the user route and travel window.',
+                'Write a short, natural headline and a concise plain-language notification for the commuter. Judge the seriousness, whether the route is affected, and whether the user should continue, leave earlier, check SL, or take a taxi.',
+                'The notification should be warm and useful, mention the relevant route or disruption and travel timing when the data supports it, and avoid generic wording. Do not claim a taxi was booked; the app only prepares a demo ride for review.',
+                'Recommend taxi when the reported or live delay exceeds the user delay buffer, or the route is seriously blocked. Recommend leave_early only if an actionable disruption threatens the route. If evidence is insufficient, use check_sl.',
+              ].join(' '),
+            },
+          ],
+        },
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: JSON.stringify({
+                  route,
+                  travel_window: window,
+                  delay_buffer_minutes: delayBuffer,
+                  planner_delay_minutes: predictedDelayMinutes,
+                  matching_sl_notices: notices,
+                }),
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          responseJsonSchema: schema,
+        },
+      },
+    },
+  );
+  const text =
+    response.candidates?.[0]?.content?.parts?.find((part) => typeof part.text === 'string')?.text ||
+    '';
+  const parsed = JSON.parse(text || 'null');
+  const severities = new Set(['low', 'moderate', 'high', 'critical']);
+  const recommendations = new Set(['continue', 'leave_early', 'taxi', 'check_sl']);
+  if (
+    typeof parsed?.affected !== 'boolean' ||
+    !severities.has(parsed.severity) ||
+    !recommendations.has(parsed.recommendation) ||
+    typeof parsed.headline !== 'string' ||
+    typeof parsed.notification !== 'string'
+  ) {
+    throw new Error('Gemini returned an invalid commute assessment.');
+  }
+  return {
+    provider: 'Gemini',
+    model,
+    severity: parsed.severity,
+    affected: parsed.affected,
+    recommendation: parsed.recommendation,
+    reason: String(parsed.reason || '').slice(0, 400),
+    headline: parsed.headline.slice(0, 100),
+    notification: parsed.notification.slice(0, 500),
+  };
+}
+
 function stockholmNow() {
   const values = Object.fromEntries(
     new Intl.DateTimeFormat('en-GB', {
@@ -251,7 +447,7 @@ async function checkDisruptions(settings, scheduled) {
     plannedArrival && estimatedArrival
       ? Math.max(0, Math.round((Date.parse(estimatedArrival) - Date.parse(plannedArrival)) / 60000))
       : 0;
-  const predictedDelayMinutes = Math.max(estimateDelta, arrivalDelta);
+  let noticeDelayMinutes = 0;
   const customIds = new Set(
     String(settings.line_ids || '')
       .replaceAll(';', ',')
@@ -287,6 +483,7 @@ async function checkDisruptions(settings, scheduled) {
     const stopMatch = [...selectedStops].some((name) => affectedStops.has(name));
     const relevant = lines.length && stops.length ? lineMatch && stopMatch : lineMatch || stopMatch;
     if (!relevant) continue;
+    noticeDelayMinutes = Math.max(noticeDelayMinutes, reportedDelayMinutes(message));
     const variant = variants.find((v) => v.language === 'en') || variants[0] || {};
     matches.push({
       header: variant.header || 'SL disruption',
@@ -297,9 +494,48 @@ async function checkDisruptions(settings, scheduled) {
       priority: message.priority?.importance_level,
     });
   }
+  const predictedDelayMinutes = Math.max(estimateDelta, arrivalDelta, noticeDelayMinutes);
   const checkedAt = new Date().toISOString();
-  const delayThreshold = Number(settings.alert_before_minutes) || 20;
-  const needsUber = Boolean(journey && predictedDelayMinutes > delayThreshold);
+  const configuredThreshold = settings.delay_buffer_minutes ?? settings.alert_before_minutes;
+  const delayThreshold = Number.isFinite(Number(configuredThreshold))
+    ? Number(configuredThreshold)
+    : 20;
+  let aiAssessment = null;
+  let aiError = null;
+  const assessmentInput = {
+    route: { lines: routeLines, stops: routeStops },
+    window: { from: travelWindow.start.toISOString(), until: travelWindow.end.toISOString() },
+    notices: matches,
+    predictedDelayMinutes,
+    delayBuffer: delayThreshold,
+  };
+  try {
+    aiAssessment = await assessWithGemini(assessmentInput);
+  } catch (error) {
+    const primaryModel = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+    const fallbackModel =
+      process.env.GEMINI_FALLBACK_MODEL ||
+      (primaryModel === 'gemini-3.5-flash-lite'
+        ? 'gemini-3.1-flash-lite'
+        : 'gemini-3.5-flash-lite');
+    if (error.status === 503 && primaryModel !== fallbackModel) {
+      console.warn(`Gemini ${primaryModel} is unavailable; trying ${fallbackModel}.`);
+      try {
+        aiAssessment = await assessWithGemini({ ...assessmentInput, model: fallbackModel });
+      } catch (fallbackError) {
+        aiError = describeGeminiError(fallbackError);
+        console.error(`Gemini fallback ${fallbackModel} failed:`, aiError);
+      }
+    } else {
+      aiError = describeGeminiError(error);
+      console.error('Gemini commute assessment failed:', aiError);
+    }
+  }
+  const needsUber = Boolean(
+    journey &&
+    (predictedDelayMinutes > delayThreshold ||
+      (aiAssessment?.affected && aiAssessment.recommendation === 'taxi')),
+  );
   return {
     filter_version: FILTER_VERSION,
     checked_at: checkedAt,
@@ -313,6 +549,9 @@ async function checkDisruptions(settings, scheduled) {
             : 'clear',
     predicted_delay_minutes: predictedDelayMinutes,
     delay_threshold_minutes: delayThreshold,
+    ai_assessment: aiAssessment,
+    ai_error: aiError,
+    assessment_mode: aiAssessment ? 'ai' : 'rules',
     needs_uber: needsUber,
     travel_window: {
       from: travelWindow.start.toISOString(),
@@ -357,11 +596,12 @@ function createDemoUberBooking(settings, result) {
   return booking;
 }
 
-async function runCheck(scheduled = false) {
-  if (checking) return (await readSettings()).last_result;
-  checking = true;
+async function runCheck(userId, scheduled = false) {
+  if (checking.has(userId)) return (await readSettings(userId))?.last_result;
+  checking.add(userId);
   try {
-    const settings = await readSettings();
+    const settings = await readSettings(userId);
+    if (!settings) return null;
     let result;
     try {
       result = await checkDisruptions(settings, scheduled);
@@ -377,51 +617,59 @@ async function runCheck(scheduled = false) {
     }
     const demoBooking = createDemoUberBooking(settings, result);
     if (demoBooking) result.fake_uber_booking = demoBooking;
-    await writeSettings({ ...settings, last_check: result.checked_at, last_result: result });
+    await writeSettings(userId, {
+      ...settings,
+      last_check: result.checked_at,
+      last_result: result,
+    });
     return result;
   } finally {
-    checking = false;
+    checking.delete(userId);
   }
 }
 
 async function scheduleTick() {
   try {
     const now = stockholmNow();
-    const settings = await readSettings();
-    const [departureHour, departureMinute] = String(settings.departure_time || '08:00')
-      .split(':')
-      .map(Number);
-    const alertMinutes = Number(settings.alert_before_minutes) || 20;
-    const checkAt = new Date(Date.UTC(2000, 0, 1, departureHour, departureMinute - alertMinutes));
-    const targetTime = `${String(checkAt.getUTCHours()).padStart(2, '0')}:${String(checkAt.getUTCMinutes()).padStart(2, '0')}`;
-    const week = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-    const targetDay =
-      departureHour * 60 + departureMinute < alertMinutes
-        ? week[(week.indexOf(now.weekday) + 1) % week.length]
-        : now.weekday;
-    if (
-      settings.home &&
-      settings.office &&
-      (settings.days || []).includes(targetDay) &&
-      now.hour + ':' + now.minute === targetTime &&
-      settings.last_scheduled_minute !== now.stamp
-    ) {
-      await writeSettings({ ...settings, last_scheduled_minute: now.stamp });
-      await runCheck(true);
+    const store = await readStore();
+    for (const userId of Object.keys(store.users)) {
+      const settings = await readSettings(userId);
+      if (!settings) continue;
+      const [departureHour, departureMinute] = String(settings.departure_time || '08:00')
+        .split(':')
+        .map(Number);
+      const alertMinutes = Number(settings.alert_before_minutes) || 20;
+      const checkAt = new Date(Date.UTC(2000, 0, 1, departureHour, departureMinute - alertMinutes));
+      const targetTime = `${String(checkAt.getUTCHours()).padStart(2, '0')}:${String(checkAt.getUTCMinutes()).padStart(2, '0')}`;
+      const week = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+      const targetDay =
+        departureHour * 60 + departureMinute < alertMinutes
+          ? week[(week.indexOf(now.weekday) + 1) % week.length]
+          : now.weekday;
+      if (
+        settings.home &&
+        settings.office &&
+        (settings.days || []).includes(targetDay) &&
+        now.hour + ':' + now.minute === targetTime &&
+        settings.last_scheduled_minute !== now.stamp
+      ) {
+        await writeSettings(userId, { ...settings, last_scheduled_minute: now.stamp });
+        await runCheck(userId, true);
+      }
     }
   } catch (error) {
     console.error('Schedule check failed:', error.message);
   }
 }
 
-function send(response, status, payload, type = 'application/json; charset=utf-8') {
+function send(response, status, payload, type = 'application/json; charset=utf-8', headers = {}) {
   const data = Buffer.isBuffer(payload) ? payload : Buffer.from(JSON.stringify(payload));
   response.writeHead(status, {
     'Content-Type': type,
     'Content-Length': data.length,
     'Cache-Control': type.includes('json') ? 'no-store' : 'public, max-age=300',
     'X-Content-Type-Options': 'nosniff',
-    'Access-Control-Allow-Origin': process.env.CORS_ORIGIN || '*',
+    ...headers,
   });
   response.end(data);
 }
@@ -438,16 +686,90 @@ async function readBody(request) {
 async function handle(request, response) {
   const url = new URL(request.url, 'http://127.0.0.1:8765');
   try {
-    if (request.method === 'OPTIONS') {
-      response.writeHead(204, {
-        'Access-Control-Allow-Origin': process.env.CORS_ORIGIN || '*',
-        'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-      });
-      return response.end();
+    if (request.method === 'GET' && url.pathname === '/api/auth/me') {
+      const userId = sessionUser(request);
+      const store = await readStore();
+      return send(response, 200, { user: publicUser(userId ? store.users[userId] : null) });
     }
-    if (request.method === 'GET' && url.pathname === '/api/settings')
-      return send(response, 200, await readSettings());
+    if (
+      request.method === 'POST' &&
+      ['/api/auth/register', '/api/auth/login'].includes(url.pathname)
+    ) {
+      const body = await readBody(request);
+      const username = String(body.username || '')
+        .trim()
+        .toLowerCase();
+      const password = String(body.password || '');
+      if (!/^[a-z0-9._-]{3,32}$/u.test(username)) {
+        return send(response, 400, {
+          error: 'Username must be 3–32 characters: letters, numbers, dot, dash or underscore.',
+        });
+      }
+      if (password.length < 10 || password.length > 200) {
+        return send(response, 400, { error: 'Password must be between 10 and 200 characters.' });
+      }
+      const store = await readStore();
+      let user = Object.values(store.users).find((entry) => entry.username === username);
+      if (url.pathname.endsWith('/register')) {
+        if (user) return send(response, 409, { error: 'That username is already registered.' });
+        const salt = randomBytes(16);
+        const hash = await scrypt(password, salt, 64);
+        user = await updateStore((current) => {
+          if (Object.values(current.users).some((entry) => entry.username === username))
+            return null;
+          const firstAccount = Object.keys(current.users).length === 0;
+          const settings =
+            firstAccount && current.legacy_settings
+              ? { ...DEFAULTS, ...current.legacy_settings }
+              : { ...DEFAULTS };
+          if (settings.last_result?.filter_version !== FILTER_VERSION) {
+            settings.last_result = null;
+            settings.last_check = null;
+          }
+          const account = {
+            id: randomUUID(),
+            username,
+            password_salt: salt.toString('hex'),
+            password_hash: hash.toString('hex'),
+            settings,
+          };
+          current.users[account.id] = account;
+          if (firstAccount) current.legacy_settings = null;
+          return account;
+        });
+        if (!user) return send(response, 409, { error: 'That username is already registered.' });
+      } else {
+        if (!user) return send(response, 401, { error: 'Username or password is incorrect.' });
+        const expected = Buffer.from(user.password_hash, 'hex');
+        const supplied = await scrypt(
+          password,
+          Buffer.from(user.password_salt, 'hex'),
+          expected.length,
+        );
+        if (expected.length !== supplied.length || !timingSafeEqual(expected, supplied)) {
+          return send(response, 401, { error: 'Username or password is incorrect.' });
+        }
+      }
+      return createAccountSession(response, user);
+    }
+    if (request.method === 'POST' && url.pathname === '/api/auth/logout') {
+      const token = request.headers.cookie
+        ?.split(';')
+        .map((part) => part.trim())
+        .find((part) => part.startsWith(`${SESSION_COOKIE}=`))
+        ?.slice(SESSION_COOKIE.length + 1);
+      if (token) sessions.delete(token);
+      return send(response, 200, { ok: true }, 'application/json; charset=utf-8', {
+        'Set-Cookie': sessionCookie('', 0),
+      });
+    }
+    const userId = sessionUser(request);
+    if (url.pathname.startsWith('/api/') && !url.pathname.startsWith('/api/auth/') && !userId) {
+      return send(response, 401, { error: 'Sign in to continue.' });
+    }
+    if (request.method === 'GET' && url.pathname === '/api/settings') {
+      return send(response, 200, await readSettings(userId));
+    }
     if (request.method === 'GET' && url.pathname === '/api/lookup') {
       const query = url.searchParams.get('q')?.trim();
       if (!query) return send(response, 400, { error: 'Enter an address or stop.' });
@@ -461,8 +783,12 @@ async function handle(request, response) {
       const journey = (route.journeys || route.trips || [])[0];
       const routeLines = extractLines(route);
       const routeStops = extractStops(journey);
-      const settings = await readSettings();
-      await writeSettings({ ...settings, route_lines: routeLines, route_stops: routeStops });
+      const settings = await readSettings(userId);
+      await writeSettings(userId, {
+        ...settings,
+        route_lines: routeLines,
+        route_stops: routeStops,
+      });
       return send(response, 200, {
         route_lines: routeLines,
         route_stops: routeStops,
@@ -470,32 +796,44 @@ async function handle(request, response) {
       });
     }
     if (request.method === 'GET' && url.pathname === '/api/check')
-      return send(response, 200, await runCheck());
+      return send(response, 200, await runCheck(userId));
     if (request.method === 'POST') {
       const body = await readBody(request);
-      if (url.pathname === '/api/settings')
-        return send(response, 200, await writeSettings({ ...(await readSettings()), ...body }));
+      if (url.pathname === '/api/settings') {
+        const current = await readSettings(userId);
+        const updated = { ...current, ...body };
+        const configFields = [
+          'home_location',
+          'office_location',
+          'departure_time',
+          'alert_before_minutes',
+          'delay_buffer_minutes',
+          'days',
+        ];
+        const configurationChanged = configFields.some(
+          (field) =>
+            JSON.stringify(current[field] ?? null) !== JSON.stringify(updated[field] ?? null),
+        );
+        if (configurationChanged) {
+          updated.last_result = null;
+          updated.last_check = null;
+          updated.last_scheduled_minute = null;
+        }
+        const saved = await writeSettings(userId, updated);
+        return send(response, 200, { ...saved, configuration_changed: configurationChanged });
+      }
     }
 
     if (
       request.method === 'GET' &&
-      (url.pathname === '/' ||
-        ['/app.js', '/style.css', '/manifest.webmanifest', '/sw.js', '/icon.svg'].includes(
-          url.pathname,
-        ))
+      (url.pathname === '/' || ['/app.js', '/style.css'].includes(url.pathname))
     ) {
       const name = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
       const type = name.endsWith('.js')
         ? 'text/javascript; charset=utf-8'
         : name.endsWith('.css')
           ? 'text/css; charset=utf-8'
-          : name.endsWith('.webmanifest')
-            ? 'application/manifest+json'
-            : name.endsWith('.svg')
-              ? 'image/svg+xml'
-              : name === 'sw.js'
-                ? 'text/javascript; charset=utf-8'
-                : 'text/html; charset=utf-8';
+          : 'text/html; charset=utf-8';
       return send(response, 200, await readFile(path.join(ROOT, name)), type);
     }
     return send(response, 404, { error: 'Not found.' });
@@ -508,14 +846,26 @@ async function handle(request, response) {
 const server = http.createServer((request, response) => {
   void handle(request, response);
 });
-server.listen(PORT, HOST, () => {
-  const address = `http://127.0.0.1:${PORT}`;
+let listenPort = PORT;
+server.on('error', (error) => {
+  if (error.code === 'EADDRINUSE' && listenPort < PORT + 20) {
+    listenPort += 1;
+    console.warn(`Port ${listenPort - 1} is busy; trying ${listenPort}.`);
+    setImmediate(() => server.listen(listenPort, HOST));
+    return;
+  }
+  console.error('Could not start the local commute service:', error.message);
+  process.exitCode = 1;
+});
+server.on('listening', () => {
+  const address = `http://127.0.0.1:${listenPort}`;
   console.log(
     `SL Commute Agent is running at ${address}. Keep this window open for scheduled checks.`,
   );
   if (process.env.SL_AGENT_NO_BROWSER !== '1')
     import('node:child_process').then(({ exec }) => exec(`start "" "${address}"`));
 });
+server.listen(listenPort, HOST);
 setInterval(() => {
   void scheduleTick();
 }, 15_000);

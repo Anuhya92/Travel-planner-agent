@@ -4,138 +4,197 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#f7f8fa" />
-    <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
-    <link rel="manifest" href="/manifest.webmanifest" />
-    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
     <title>SL Commute Agent</title>
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
     <main class="shell">
-      <header class="topbar">
-        <div class="brand">
-          <span class="mark">S</span>
-          <div><strong>Commute Agent</strong><small>Stockholm · SL + Uber</small></div>
-        </div>
-        <span id="serverStatus" class="status-pill">Starting…</span>
-      </header>
-      <section class="hero">
-        <div>
-          <p class="eyebrow">YOUR DAILY COMMUTE</p>
+      <section id="authPanel" class="auth-panel hidden" aria-labelledby="authTitle">
+        <div class="auth-intro">
+          <p class="eyebrow">SL COMMUTE AGENT</p>
           <h1>Arrive with a plan.</h1>
           <p class="lede">
-            Check SL before you leave. If disruption affects your route, review a taxi option in
-            Uber.
+            Create an account to save your commute privately and get route-specific disruption
+            updates before departure.
           </p>
         </div>
-        <div class="hero-icon" aria-hidden="true">↗</div>
+        <form id="authForm" class="card auth-card">
+          <p class="eyebrow">YOUR ACCOUNT</p>
+          <h2 id="authTitle">Sign in</h2>
+          <label for="authUsername">Username</label>
+          <input
+            id="authUsername"
+            name="username"
+            autocomplete="username"
+            required
+            minlength="3"
+            maxlength="32"
+          />
+          <label for="authPassword">Password</label>
+          <input
+            id="authPassword"
+            name="password"
+            type="password"
+            autocomplete="current-password"
+            required
+            minlength="10"
+            maxlength="200"
+          />
+          <p id="authHint" class="fineprint">
+            Use your username and password to open your commute.
+          </p>
+          <p id="authError" class="auth-error" role="alert"></p>
+          <button id="authSubmit" class="button dark full" type="submit">Sign in</button>
+          <button id="authMode" class="text-button" type="button">
+            New here? Create an account
+          </button>
+          <p class="fineprint auth-local-note">Accounts and commute details stay on this laptop.</p>
+        </form>
       </section>
-      <section class="grid">
-        <div class="card primary-card">
-          <div class="card-head">
-            <div>
-              <p class="eyebrow">LIVE STATUS</p>
-              <h2 id="statusTitle">Ready when you are</h2>
-            </div>
-            <span id="statusIcon" class="status-icon">—</span>
+      <div id="appShell" class="hidden">
+        <header class="topbar">
+          <div class="brand">
+            <span class="mark">S</span>
+            <div><strong>Commute Agent</strong><small>Stockholm · SL + Uber</small></div>
           </div>
-          <p id="statusSummary" class="muted">
-            Add your home and work locations to begin monitoring.
-          </p>
-          <p id="checkedAt" class="small muted"></p>
-          <p id="routeSummary" class="small muted"></p>
-          <div id="disruptionList" class="disruptions"></div>
-          <div class="actions">
-            <button id="checkNow" class="button dark">Check SL now</button
-            ><a id="uberLink" class="button uber hidden" href="#" target="_blank" rel="noopener"
-              >Review ride in Uber <span>↗</span></a
-            ><button id="shareAlert" class="button outline hidden">Share alert</button>
+          <div class="topbar-actions">
+            <span id="serverStatus" class="status-pill">Starting…</span>
+            <span id="accountName" class="account-name"></span>
+            <button id="logout" class="text-button" type="button">Sign out</button>
           </div>
-          <div id="bookingNote" class="result-box hidden"></div>
-        </div>
-        <div class="card settings-card">
-          <div class="card-head">
-            <div>
-              <p class="eyebrow">COMMUTE SETUP</p>
-              <h2>Your route</h2>
-            </div>
-            <span class="tiny-icon">⌖</span>
-          </div>
-          <label
-            >Home address or stop
-            <div class="lookup-row">
-              <input
-                id="homeInput"
-                placeholder="Start typing an address or stop"
-                autocomplete="off"
-              />
-            </div>
-            <div id="homeSuggestions" class="suggestions hidden" role="listbox"></div
-          ></label>
-          <label
-            >Work address or stop
-            <div class="lookup-row">
-              <input
-                id="officeInput"
-                placeholder="Start typing an address or stop"
-                autocomplete="off"
-              />
-            </div>
-            <div id="officeSuggestions" class="suggestions hidden" role="listbox"></div
-          ></label>
-          <div id="selectedSummary" class="selected-summary muted">
-            Choose a suggestion for both addresses.
-          </div>
-          <div class="schedule-row">
-            <label>Depart at<input id="departureTime" type="time" value="08:00" /></label
-            ><label
-              >Alert before<input
-                id="alertBefore"
-                type="number"
-                value="20"
-                min="5"
-                max="120"
-                step="5"
-            /></label>
-          </div>
-          <div class="schedule-row single">
-            <label
-              >Days<select id="dayPreset">
-                <option value="weekdays">Weekdays</option>
-                <option value="everyday">Every day</option>
-                <option value="custom">Choose days</option>
-              </select></label
-            >
-            <p class="fineprint threshold-note">
-              If the SL journey estimate is delayed by more than this many minutes, the alert will
-              suggest Uber.
+        </header>
+        <section class="hero">
+          <div>
+            <p class="eyebrow">YOUR DAILY COMMUTE</p>
+            <h1>Arrive with a plan.</h1>
+            <p class="lede">
+              Spot disruptions that affect your route before departure, so you can make a plan and
+              arrive at work on time. If your delay is beyond your buffer, review a taxi option in
+              Uber.
             </p>
           </div>
-          <div id="daysCustom" class="days hidden">
-            <label><input type="checkbox" value="Mon" /> Mon</label
-            ><label><input type="checkbox" value="Tue" /> Tue</label
-            ><label><input type="checkbox" value="Wed" /> Wed</label
-            ><label><input type="checkbox" value="Thu" /> Thu</label
-            ><label><input type="checkbox" value="Fri" /> Fri</label
-            ><label><input type="checkbox" value="Sat" /> Sat</label
-            ><label><input type="checkbox" value="Sun" /> Sun</label>
+          <div class="hero-icon" aria-hidden="true">↗</div>
+        </section>
+        <section class="grid">
+          <div class="card primary-card">
+            <div class="card-head">
+              <div>
+                <p class="eyebrow">LIVE STATUS</p>
+                <h2 id="statusTitle">Ready when you are</h2>
+              </div>
+              <span id="statusIcon" class="status-icon">—</span>
+            </div>
+            <p id="statusSummary" class="muted">
+              Add your home and work locations to begin monitoring.
+            </p>
+            <p id="assessmentMeta" class="fineprint"></p>
+            <p id="checkedAt" class="small muted"></p>
+            <p id="routeSummary" class="small muted"></p>
+            <div id="disruptionList" class="disruptions"></div>
+            <div class="actions">
+              <button id="checkNow" class="button dark">
+                <span class="spinner hidden" aria-hidden="true"></span>
+                <span id="checkNowLabel">Check SL now</span></button
+              ><a id="uberLink" class="button uber hidden" href="#" target="_blank" rel="noopener"
+                >Review ride in Uber <span>↗</span></a
+              ><button id="shareAlert" class="button outline hidden">Share alert</button>
+            </div>
+            <p id="checkingStatus" class="checking-status hidden" role="status" aria-live="polite">
+              Gemini is assessing your route and travel window. This can take up to a minute…
+            </p>
+            <div id="bookingNote" class="result-box hidden"></div>
           </div>
-          <button id="saveSettings" class="button dark full">Save commute & schedule</button>
-          <p class="fineprint">
-            Keep the agent running for scheduled checks. Allow browser notifications when prompted.
-          </p>
-        </div>
-      </section>
-      <footer>
-        SL locations and journey estimates come from SL’s journey planner. Delay alerts create a
-        local demo ride for display; open Uber separately to review and confirm a real booking.
-      </footer>
+          <div class="card settings-card">
+            <div class="card-head">
+              <div>
+                <p class="eyebrow">COMMUTE SETUP</p>
+                <h2>Your route</h2>
+              </div>
+              <span class="tiny-icon">⌖</span>
+            </div>
+            <label
+              >Home address or stop
+              <div class="lookup-row">
+                <input
+                  id="homeInput"
+                  placeholder="Start typing an address or stop"
+                  autocomplete="off"
+                />
+              </div>
+              <div id="homeSuggestions" class="suggestions hidden" role="listbox"></div
+            ></label>
+            <label
+              >Work address or stop
+              <div class="lookup-row">
+                <input
+                  id="officeInput"
+                  placeholder="Start typing an address or stop"
+                  autocomplete="off"
+                />
+              </div>
+              <div id="officeSuggestions" class="suggestions hidden" role="listbox"></div
+            ></label>
+            <div id="selectedSummary" class="selected-summary muted">
+              Choose a suggestion for both addresses.
+            </div>
+            <div class="schedule-row">
+              <label>Depart at<input id="departureTime" type="time" value="08:00" /></label
+              ><label
+                >Alert before (mins)<input
+                  id="alertBefore"
+                  type="number"
+                  value="20"
+                  min="5"
+                  max="120"
+                  step="5"
+              /></label>
+            </div>
+            <div class="schedule-row single">
+              <label
+                >Delay buffer (mins)<input
+                  id="delayBuffer"
+                  type="number"
+                  value="20"
+                  min="0"
+                  max="120"
+                  step="5"
+              /></label>
+              <p class="fineprint threshold-note">
+                A demo Uber ride is created when the reported delay is greater than this buffer.
+              </p>
+            </div>
+            <div class="schedule-row single">
+              <label
+                >Days<select id="dayPreset">
+                  <option value="weekdays">Weekdays</option>
+                  <option value="everyday">Every day</option>
+                  <option value="custom">Choose days</option>
+                </select></label
+              >
+              <span></span>
+            </div>
+            <div id="daysCustom" class="days hidden">
+              <label><input type="checkbox" value="Mon" /> Mon</label
+              ><label><input type="checkbox" value="Tue" /> Tue</label
+              ><label><input type="checkbox" value="Wed" /> Wed</label
+              ><label><input type="checkbox" value="Thu" /> Thu</label
+              ><label><input type="checkbox" value="Fri" /> Fri</label
+              ><label><input type="checkbox" value="Sat" /> Sat</label
+              ><label><input type="checkbox" value="Sun" /> Sun</label>
+            </div>
+            <button id="saveSettings" class="button dark full">Save commute & schedule</button>
+            <p class="fineprint">
+              Keep the agent running for scheduled checks. Allow browser notifications when
+              prompted.
+            </p>
+          </div>
+        </section>
+        <footer>
+          Local laptop prototype. SL provides the route and disruption data; Gemini can assess
+          matching notices when an API key is configured. Demo rides are simulations only.
+        </footer>
+      </div>
     </main>
     <script src="/app.js"></script>
-    <script>
-      if ('serviceWorker' in navigator)
-        window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
-    </script>
   </body>
 </html>
