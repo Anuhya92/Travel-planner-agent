@@ -6,6 +6,7 @@ let searchTimers = {};
 let formTouched = new Set();
 const sessionStartedAt = Date.now();
 const $ = (id) => document.getElementById(id);
+let authMode = 'login';
 
 async function request(url, options = {}) {
   const response = await fetch(url, {
@@ -92,13 +93,13 @@ async function searchLocations(side, query) {
 }
 
 function showStatus(result) {
-  $('assessmentMeta').textContent = result
-    ? result.ai_assessment
-      ? `AI assessment · ${result.ai_assessment.severity} · ${result.ai_assessment.affected ? 'route affected' : 'route impact unclear'} · ${result.ai_assessment.recommendation.replaceAll('_', ' ')}`
+  $('assessmentMeta').textContent = !result
+    ? ''
+    : result.ai_assessment
+      ? `AI assessment · ${result.ai_assessment.model} · ${result.ai_assessment.severity} · ${result.ai_assessment.affected ? 'route affected' : 'route impact unclear'} · ${result.ai_assessment.recommendation.replaceAll('_', ' ')}`
       : result.assessment_mode === 'rules'
-        ? 'Rule-based assessment · Gemini is not configured or could not be reached.'
-        : ''
-    : '';
+        ? `AI assessment unavailable · ${result.ai_error || 'Showing the SL and journey-planner result.'}`
+        : '';
   if (!result) {
     $('disruptionList').replaceChildren();
     $('bookingNote').classList.add('hidden');
@@ -423,4 +424,68 @@ function init() {
   setInterval(poll, 5000);
 }
 
-init();
+function showAuth(mode = 'login') {
+  authMode = mode;
+  $('appShell').classList.add('hidden');
+  $('authPanel').classList.remove('hidden');
+  $('authTitle').textContent = mode === 'register' ? 'Create your account' : 'Sign in';
+  $('authSubmit').textContent = mode === 'register' ? 'Create account' : 'Sign in';
+  $('authMode').textContent =
+    mode === 'register' ? 'Already have an account? Sign in' : 'New here? Create an account';
+  $('authPassword').autocomplete = mode === 'register' ? 'new-password' : 'current-password';
+  $('authHint').textContent =
+    mode === 'register'
+      ? 'Usernames use 3–32 letters, numbers, dots, dashes or underscores. Passwords need at least 10 characters.'
+      : 'Use your username and password to open your commute.';
+  $('authError').textContent = '';
+}
+
+function showApp(user) {
+  $('authPanel').classList.add('hidden');
+  $('appShell').classList.remove('hidden');
+  $('accountName').textContent = user.username;
+  init();
+}
+
+async function startApp() {
+  $('authMode').addEventListener('click', () =>
+    showAuth(authMode === 'register' ? 'login' : 'register'),
+  );
+  $('authForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    $('authError').textContent = '';
+    $('authSubmit').disabled = true;
+    try {
+      const result = await request(`/api/auth/${authMode === 'register' ? 'register' : 'login'}`, {
+        method: 'POST',
+        body: JSON.stringify({
+          username: $('authUsername').value,
+          password: $('authPassword').value,
+        }),
+      });
+      showApp(result.user);
+    } catch (error) {
+      $('authError').textContent = error.message;
+    } finally {
+      $('authSubmit').disabled = false;
+    }
+  });
+  $('logout').addEventListener('click', async () => {
+    try {
+      await request('/api/auth/logout', { method: 'POST', body: '{}' });
+      window.location.reload();
+    } catch (error) {
+      alert(error.message);
+    }
+  });
+  try {
+    const { user } = await request('/api/auth/me');
+    if (user) showApp(user);
+    else showAuth();
+  } catch (error) {
+    showAuth();
+    $('authError').textContent = `Could not connect to the local commute service: ${error.message}`;
+  }
+}
+
+startApp();
